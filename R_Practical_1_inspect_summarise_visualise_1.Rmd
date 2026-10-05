@@ -1,0 +1,835 @@
+---
+title: "R Practical 1: Inspect, Summarise and Visualise"
+subtitle: "Data Science for Health Systems | Washa Takwimu 2026 Short Course | Day 1"
+author: "Heather Mattie, PhD, Harvard T.H. Chan School of Public Health"
+date: "Monday 5 October 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include = FALSE}
+# Global chunk options for the whole document.
+# echo = TRUE   : show the code in the knitted output (this is a teaching document)
+# message/warning = FALSE : keep the knitted output tidy; you will still see
+#                 messages when you run chunks interactively in RStudio
+# fig.width / fig.height : default figure size in inches
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 8,
+  fig.height = 5.5,
+  fig.align  = "center"
+)
+```
+
+# How to use this document {-}
+
+This R Markdown file is your workbook for the session. It contains:
+
+* **Text** that explains *why* we are doing each step (read this, it matters as much as the code).
+* **Code chunks** (grey boxes) with comments on almost every line. Run each chunk with the green ▶ button, or put your cursor inside a chunk and press **Ctrl + Shift + Enter** (Windows/Linux) or **Cmd + Shift + Enter** (Mac).
+* **Checkpoints** (🔎) where you pause, look at the output and answer a question for yourself.
+* **Self-assessment questions** in Section 8, with solutions hidden behind a "Show solution" button. Try them before you look.
+* **FAQs** in Section 9 for the problems people most often run into.
+
+When you finish, click **Knit** at the top of RStudio to produce an HTML report. A document that knits from top to bottom without errors is a *reproducible* analysis: anyone with the same data file can re-create every number and graph.
+
+> **Pace.** We will not run every chunk together in 90 minutes. The facilitator will focus on the core steps in Sections 3 to 7. Sections marked *(optional)* and the self-assessment questions are for after the session.
+
+---
+
+# Introduction
+
+## Where this practical fits in the week
+
+This is the first hands-on R session of the five-day Data Science for Health Systems course. Earlier today you looked at health-system goals, building blocks, and data ethics, governance and equity. This practical shows how to produce a reproducible first summary and graph in R and state one limitation.
+
+The later practicals build on what you do today:
+
+| Day | Practical | What it builds on from today |
+|-----|-----------|------------------------------|
+| 2 | 2A Data-quality diagnosis | The missing-value and range checks you start here |
+| 2 | 2B Reshape, join and audit | How the data file for today was combined from three files (Section 1.5) |
+| 3 | 3A/3B Maps and access | Summaries by geographic unit (here: county) |
+| 4–5 | Interpretation and decision brief | Stating limitations honestly |
+
+## Learning objectives
+
+By the end of this practical you will be able to:
+
+1. **Inspect** a health dataset: its size, structure, variable types, unit of observation, missing values and ranges, using a data dictionary.
+2. **Summarise one indicator** with a clear numerator, denominator, place and period, overall and by subgroup, and judge when numbers are too small to trust.
+3. **Visualise** that indicator in a fully labelled `ggplot2` graph that someone outside the room could understand.
+4. **Record a limitation** of the data or indicator in plain language, and save it with your outputs.
+
+## The decision problem we will use
+
+To keep the analysis tied to a real health-system use, we work with one framing throughout:
+
+| Decision Canvas element | Our example |
+|------------------------|-------------|
+| **Decision-maker** | A state-level COVID-19 response coordinator |
+| **Decision** | Where to prioritise extra hospital-bed and staff capacity in the next wave |
+| **Population** | People with a recorded COVID-19 diagnosis |
+| **Place** | The 14 counties of the state (our stand-in for *districts*) |
+| **Period** | The first wave in the data: 20 January to 30 March 2020 |
+| **Intended action** | Flag counties where a larger share of diagnosed patients needed admission |
+
+Our **indicator** is therefore:
+
+> **Percentage of patients diagnosed with COVID-19 who were admitted to hospital for COVID-19**, by county of residence.
+
+## About the data
+
+We are using data from the **Synthea COVID-19 10K** synthetic dataset (CSV version) from <https://synthetichealth.github.io/synthea/>. Some things you must know before analysing it:
+
+* **The data are synthetic.** Synthea is a simulator. It generates realistic-looking but *fictional* patient records from published disease models. No real person is in these data. That is why we can share them freely in a training course.
+* **The setting is Massachusetts, USA.** Patients live in the 14 counties of Massachusetts and use Massachusetts hospitals. The health system, insurance structure and population are very different from the settings you work in. We use the counties as a stand-in for districts, but the *numbers* tell us nothing about any African health system. The *methods* transfer directly.
+* **The original download is an electronic-health-record (EHR) style dataset**, split into 16 linked tables (patients, encounters, conditions, medications, observations and others). Each table has one row per *event* (one visit, one diagnosis, one lab result). Many routine health-information systems such as DHIS2 report aggregated facility-month data; patient-level EHR data are the raw material that such aggregates can be built from.
+
+For today, we have combined the three tables we need into **one file, `covid_patients.csv`, with one row per patient diagnosed with COVID-19**. Section 1.5 explains exactly how.
+
+### Data dictionary for `covid_patients.csv`
+
+A data dictionary tells you what each variable *means*, which is not always obvious from the name. Definitions of the original variables are from the official Synthea CSV data dictionary: <https://github.com/synthetichealth/synthea/wiki/CSV-File-Data-Dictionary>.
+
+| Variable | Type | Description | Comes from |
+|----------|------|-------------|------------|
+| `patient_id` | text | Unique identifier of the patient (synthetic) | `patients.Id` |
+| `covid_date` | date | Date COVID-19 was diagnosed | `conditions.START` |
+| `birth_date` | date | Date the patient was born | `patients.BIRTHDATE` |
+| `death_date` | date | Date the patient died (blank if alive at the end of the simulation; any cause) | `patients.DEATHDATE` |
+| `sex` | text | `M` = male, `F` = female | `patients.GENDER` |
+| `county` | text | County of the patient's address | `patients.COUNTY` |
+| `zip` | text | Postal (ZIP) code of the patient's address | `patients.ZIP` |
+| `admitted` | TRUE/FALSE | `TRUE` if the patient had at least one hospital admission for COVID-19 | derived from `encounters` |
+
+## How the combined file was made
+
+You do **not** need to run this code today: the combined file is already in your `data` folder. It is shown so that you know exactly where every number comes from (this is called **data provenance**), and because on Day 2 you will practise joining files yourself.
+
+We started from three files in the Synthea download:
+
+| File | One row per… | What we took from it |
+|------|-------------|----------------------|
+| `conditions.csv` | diagnosis (114,544 rows) | Patients with a **confirmed COVID-19** diagnosis and the diagnosis date. This is the **denominator**. |
+| `patients.csv` | patient (12,352 rows) | Birth date, death date, sex, county and ZIP code |
+| `encounters.csv` | healthcare visit (321,528 rows) | Patients with a **hospital admission for COVID-19**. This is the **numerator**. |
+
+The steps were:
+
+1. **Select the COVID-19 diagnoses** from `conditions.csv`: rows with SNOMED-CT code `840539006` (*COVID-19*). Rows coded `840544004` (*Suspected COVID-19*) were *not* included. This gave 8,820 patients, each with exactly one COVID-19 diagnosis.
+2. **Select the COVID-19 hospital admissions** from `encounters.csv`: encounters with code `1505002` (*Hospital admission for isolation*) whose reason code was `840539006` (COVID-19). We kept **one row per patient** (1,867 patients), so that a patient with two admissions could not be counted twice.
+3. **Keep only the patient variables we need** from `patients.csv`. Names, social security, passport and driving-licence numbers, street addresses and exact coordinates were **dropped**. Even though they are synthetic, this practises *data minimisation* from this morning's ethics session.
+4. **Combine** the three pieces using the patient ID, which appears in all three files (`PATIENT` in conditions and encounters, `Id` in patients). We started from the 8,820 diagnosed patients and added the patient details and the admission flag. Patients with no admission were given `admitted = FALSE`.
+5. **Check the result**: still 8,820 rows (no one gained or lost), every patient matched a county, and every admitted patient was also a diagnosed patient.
+
+The code that did this is below (it is also provided as the script `make_covid_patients.R`). The chunk option `eval = FALSE` means R shows the code but does not run it.
+
+```{r make-combined-file, eval = FALSE}
+# --- Read the three source files ---
+conditions <- read_csv("data/conditions.csv")
+patients   <- read_csv("data/patients.csv")
+encounters <- read_csv("data/encounters.csv",
+                       col_select = c(PATIENT, CODE, REASONCODE))
+
+# --- Step 1: denominator = confirmed COVID-19 diagnoses ---
+covid_dx <- conditions %>%
+  filter(CODE == 840539006) %>%                     # COVID-19 (confirmed)
+  select(patient_id = PATIENT, covid_date = START)
+
+# --- Step 2: numerator = hospital admissions for COVID-19, one row per patient ---
+covid_admitted <- encounters %>%
+  filter(CODE == 1505002, REASONCODE == 840539006) %>%
+  distinct(patient_id = PATIENT) %>%
+  mutate(admitted = TRUE)
+
+# --- Step 3: patient details, without personal identifiers ---
+patient_info <- patients %>%
+  select(patient_id = Id, birth_date = BIRTHDATE, death_date = DEATHDATE,
+         sex = GENDER, county = COUNTY, zip = ZIP)
+
+# --- Step 4: combine, starting from the diagnosed patients ---
+covid_patients <- covid_dx %>%
+  left_join(patient_info,   by = "patient_id") %>%
+  left_join(covid_admitted, by = "patient_id") %>%
+  mutate(admitted = replace_na(admitted, FALSE))
+
+# --- Step 5: save ---
+write_csv(covid_patients, "data/covid_patients.csv", na = "")
+```
+
+> **Key idea: definitions are choices.** Using *confirmed* rather than *suspected* COVID-19, and counting only *admission for isolation* encounters, are decisions. A different choice would give a different indicator. Writing these choices down, as above, is what makes an analysis transparent.
+
+---
+
+## Load packages
+
+We only need the **tidyverse**, a collection of packages that share a common style. It includes `readr` (reading files), `dplyr` (data manipulation), `ggplot2` (graphs), `lubridate` (dates), `stringr` (text) and `forcats` (categories).
+
+```{r load-packages}
+# Load the tidyverse. If you see "there is no package called 'tidyverse'",
+# run install.packages("tidyverse") once in the Console (not in this file).
+library(tidyverse)
+
+# Create the outputs folder if it does not already exist.
+# showWarnings = FALSE stops R complaining if the folder is already there.
+dir.create("outputs", showWarnings = FALSE)
+```
+
+## Read in the data
+
+`readr::read_csv()` reads a CSV file. It guesses the type of each column and returns a **tibble** (a modern data frame that prints neatly).
+
+```{r read-data}
+# One row per patient diagnosed with COVID-19
+covid <- read_csv("data/covid_patients.csv")
+```
+
+> 🔎 **Checkpoint.** Look at the **Environment** pane (top right). You should see `covid` with 8,820 observations of 8 variables.
+
+---
+
+# Inspect: get to know the data before you analyse it
+
+**Inspection** answers: *What is in this file, and can I trust it for my question?* Skipping this step is one of the most common causes of wrong results in health data analysis. We will check:
+
+1. Size (rows and columns)
+2. Structure and variable types
+3. The unit of observation (what one row is) and whether IDs are unique
+4. Missing values
+5. Ranges of dates and the categories present
+
+## Size and structure
+
+`dim()` gives rows and columns. `glimpse()` shows every column, its type and the first few values: the single most useful inspection function. `head()` shows the first rows as a table.
+
+```{r inspect-dim}
+# Number of rows and columns
+dim(covid)
+```
+
+```{r inspect-glimpse}
+# One line per column: name, type (<chr> text, <date>, <lgl> TRUE/FALSE) and first values
+glimpse(covid)
+```
+
+```{r inspect-head}
+# First 6 rows
+head(covid)
+```
+
+Things to notice:
+
+* `read_csv()` recognised `covid_date`, `birth_date` and `death_date` as **dates** (`<date>`). That means we can do arithmetic on them, such as calculating age at diagnosis.
+* `admitted` was read as **logical** (`<lgl>`, `TRUE`/`FALSE`). This is very convenient for counting, as we will see.
+* `zip` was read as **text** (`<chr>`). That is correct: postal codes such as `01106` would lose the leading zero if stored as numbers.
+
+## Unit of observation and unique identifiers
+
+Before counting anything, confirm what one row represents. If the file really is one row per patient, the number of distinct `patient_id`s should equal the number of rows.
+
+```{r inspect-keys}
+covid %>%
+  summarise(
+    n_rows        = n(),                       # total rows
+    n_unique_ids  = n_distinct(patient_id)     # number of different patients
+  )
+```
+
+> 🔎 **Checkpoint.** The two numbers are equal, so each row is one patient. Why does this matter? If a patient appeared twice, they would be counted twice in both the numerator and the denominator of our indicator.
+
+## Missing values
+
+`is.na()` returns `TRUE` for a missing value. Summing `TRUE`s counts them. The code below counts missing values in every column and shows them as a percentage.
+
+```{r inspect-missing}
+covid %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%   # missing count in each column
+  pivot_longer(everything(),                              # turn the wide row into a long table
+               names_to  = "variable",
+               values_to = "n_missing") %>%
+  mutate(pct_missing = round(100 * n_missing / nrow(covid), 1)) %>%
+  arrange(desc(n_missing))
+```
+
+How to read this:
+
+* **`death_date` is missing for most patients.** That is *expected*: a missing death date means the person was alive at the end of the simulation. Missing does not always mean "data problem"; sometimes it carries meaning.
+* **`zip` is missing for almost half of patients.** That *would* be a real data-quality problem if we needed postal code (for example, to map small areas). We are using `county`, which is complete. On Day 2 you will look at missingness more systematically.
+* **`county`, `sex`, `birth_date` and `admitted`** (the variables we need) are complete.
+
+## Ranges and categories
+
+Check the range of dates and the categories of text variables, to catch impossible or unexpected values.
+
+```{r inspect-ranges}
+# Range of dates
+covid %>%
+  summarise(
+    first_diagnosis = min(covid_date),
+    last_diagnosis  = max(covid_date),
+    earliest_birth  = min(birth_date),
+    latest_birth    = max(birth_date)
+  )
+```
+
+```{r inspect-categories}
+# Categories of sex and county, with counts
+covid %>% count(sex)
+covid %>% count(county, sort = TRUE)   # sort = TRUE puts the largest first
+
+# How many patients were admitted?
+covid %>% count(admitted)
+```
+
+> 🔎 **Checkpoint.** All diagnoses fall between 20 January and 30 March 2020: this defines our **period**. Which county has the most patients, and which the fewest? Keep the smallest counties in mind for later.
+
+---
+
+# Prepare the variables we need
+
+Our analysis needs three small changes:
+
+* **Age at diagnosis**, calculated from `birth_date` and `covid_date`, then grouped into 10-year age groups.
+* A **shorter county name** ("Middlesex" instead of "Middlesex County") for tidier graph labels.
+* **Readable sex labels** ("Female", "Male").
+
+`mutate()` adds new columns or changes existing ones.
+
+```{r prepare-variables}
+covid <- covid %>%
+  mutate(
+    # Age in completed years on the day of diagnosis.
+    # interval() measures the time between two dates; time_length(..., "years")
+    # converts it to years (handling leap years); floor() rounds down.
+    age = floor(time_length(interval(birth_date, covid_date), "years")),
+
+    # 10-year age groups; right = FALSE means [0,10), [10,20) ... so age 10 goes in "10-19"
+    age_group = cut(
+      age,
+      breaks = c(0, 10, 20, 30, 40, 50, 60, 70, 80, Inf),
+      labels = c("0-9", "10-19", "20-29", "30-39", "40-49",
+                 "50-59", "60-69", "70-79", "80+"),
+      right  = FALSE
+    ),
+
+    # Remove the word " County" from the end of each name
+    county = str_remove(county, " County$"),
+
+    # Replace the codes with readable labels
+    sex = recode(sex, "F" = "Female", "M" = "Male")
+  )
+
+# Check the new variables
+summary(covid$age)
+covid %>% count(age_group)
+```
+
+> **Why age at diagnosis?** It is fixed at the time of the event we are studying, so it gives the same answer whenever the code is run. Calculating age from *today's* date would make everyone look older every time you re-ran the analysis, and would not describe their age when they were ill.
+
+---
+
+# Summarise one indicator
+
+## Define the indicator precisely
+
+| Component | Definition |
+|-----------|------------|
+| **Name** | COVID-19 hospital admission percentage |
+| **Numerator** | Patients with at least one *Hospital admission for isolation* encounter for COVID-19 (`admitted == TRUE`) |
+| **Denominator** | Patients with a recorded, confirmed COVID-19 diagnosis (all rows in `covid`) |
+| **Place** | County of residence (14 counties) |
+| **Period** | Diagnoses from 20 January to 30 March 2020 |
+| **Source** | Synthea COVID-19 10K synthetic EHR data |
+
+Writing it out this way forces you to decide exactly what counts. It is also exactly what a decision-maker (or a reviewer) will ask you.
+
+## Overall value
+
+Because `admitted` is `TRUE`/`FALSE`, R treats `TRUE` as 1 and `FALSE` as 0. So `sum(admitted)` **counts** the admitted patients.
+
+```{r overall-indicator}
+overall <- covid %>%
+  summarise(
+    diagnosed = n(),                         # denominator: number of rows (patients)
+    admitted  = sum(admitted),               # numerator: number of TRUEs
+    pct       = 100 * admitted / diagnosed   # indicator, as a percentage
+  )
+
+overall
+```
+
+About **1 in 5** diagnosed patients was admitted to hospital.
+
+## By county
+
+`group_by()` splits the data into groups; `summarise()` then calculates one row per group.
+
+```{r county-indicator}
+by_county <- covid %>%
+  group_by(county) %>%                      # one summary row per county
+  summarise(
+    diagnosed = n(),
+    admitted  = sum(admitted),
+    pct       = 100 * admitted / diagnosed,
+    .groups   = "drop"                      # remove the grouping afterwards
+  ) %>%
+  arrange(desc(pct))                        # highest percentage first
+
+by_county
+```
+
+> 🔎 **Checkpoint.** Which counties have the highest and lowest percentages? Now look at their `diagnosed` column. What do you notice?
+
+## Are the numbers big enough to trust?
+
+A percentage based on a small number of people can jump up or down by chance. A simple way to see this is to ask: **how much would the percentage change if just one more patient had been admitted?** For a county with `n` diagnosed patients, one patient is worth `100 / n` percentage points.
+
+We also add a simple flag for counties with **fewer than 100 diagnosed patients**, so that we remember to interpret them with caution. (The cut-off of 100 is a rule of thumb for this practical, not a statistical law.)
+
+```{r county-small-numbers}
+by_county <- by_county %>%
+  mutate(
+    one_patient = 100 / diagnosed,          # % points that one extra admission would add
+    small_n     = diagnosed < 100           # TRUE if fewer than 100 patients
+  )
+
+by_county
+```
+
+Look at the extremes:
+
+* In **Nantucket** (14 patients), a single extra admission would move the percentage by about **7 percentage points**.
+* In **Middlesex** (over 2,000 patients), one extra admission changes it by **less than 0.05 points**.
+
+So a county can look "best" or "worst" simply because it is small. The three smallest counties (Franklin, Dukes and Nantucket) are exactly the ones at the **top and bottom** of our ranking.
+
+> **Going further (optional, after the course).** The formal way to show this uncertainty is a *confidence interval*. You will meet uncertainty again on Day 4. For today, showing the number of patients (`n`) next to every percentage and flagging small numbers is a simple and honest approach that decision-makers find easy to understand.
+
+A neater version of the county table for a report:
+
+```{r county-table}
+by_county %>%
+  mutate(pct = round(pct, 1)) %>%
+  select(County = county, Diagnosed = diagnosed, Admitted = admitted,
+         `% admitted` = pct, `Fewer than 100 patients` = small_n) %>%
+  knitr::kable(caption = "COVID-19 hospital admission percentage by county, Jan to Mar 2020 (synthetic data)")
+```
+
+## By age group *(optional)*
+
+The same code, grouped by a different variable. This helps interpret the county differences, because counties with older patients would be expected to have more admissions.
+
+```{r age-indicator}
+by_age <- covid %>%
+  group_by(age_group) %>%
+  summarise(
+    diagnosed = n(),
+    admitted  = sum(admitted),
+    pct       = 100 * admitted / diagnosed,
+    .groups   = "drop"
+  )
+
+by_age
+```
+
+Admission rises steeply with age, from about 5% in children under 10 to about 35% in people aged 70 to 79.
+
+---
+
+# Visualise: a labelled graph
+
+A good health-system graph can be understood **without the analyst in the room**. That means it needs a title, clear axis labels with units, the number of people behind each value, and a caption with the data source and period.
+
+We build the graph in layers so you can see what each line of `ggplot2` code adds.
+
+## Layer 1: the basic plot
+
+```{r plot-basic, fig.height = 5}
+# ggplot(data, aes(x = ..., y = ...)) sets up the canvas and the mapping
+# geom_col() draws bars whose height is the value in the data
+ggplot(by_county, aes(x = county, y = pct)) +
+  geom_col()
+```
+
+It works, but the county names overlap, the bars are in alphabetical order (which tells us nothing) and there are no labels.
+
+## Layer 2: order the bars and make them horizontal
+
+```{r plot-ordered, fig.height = 5}
+# fct_reorder(county, pct) orders counties by their percentage
+# Putting county on the y-axis makes long names readable
+ggplot(by_county, aes(x = pct, y = fct_reorder(county, pct))) +
+  geom_col()
+```
+
+## Layer 3: a better, labelled graph
+
+```{r plot-details, fig.height = 5}
+# fct_reorder(county, pct) orders counties by their percentage
+# Putting county on the y-axis makes long names readable
+ggplot(by_county, aes(x = pct, y = fct_reorder(county, pct))) +
+  geom_col(fill = "#2a78d6") +
+  labs(
+    title    = "Share of diagnosed COVID-19 patients admitted to hospital, by county",
+    x = "Patients admitted to hospital for COVID-19 (%)",
+    y = NULL
+  )
+```
+
+
+## Layer 4: the finished, labelled graph
+
+In the finished graph, the **colour of each bar shows whether the county has fewer than 100 patients**, and each bar is labelled with its percentage and number of patients.
+
+```{r plot-final, fig.height = 6}
+p_county <- ggplot(by_county,
+                   aes(x = pct, y = fct_reorder(county, pct), fill = small_n)) +
+
+  # Bars, coloured by the small-numbers flag
+  geom_col(width = 0.7) +
+
+  # Dashed reference line at the overall (state-wide) percentage
+  geom_vline(xintercept = overall$pct, linetype = "dashed", colour = "grey40") +
+
+  # Label at the end of each bar: percentage and number of patients.
+  # geom_label() with a white fill keeps the text readable where it crosses the line;
+  # sprintf("%.1f", pct) always shows one decimal place (20.0 rather than 20).
+  geom_label(aes(label = paste0(sprintf("%.1f", pct), 
+                                "%  (n = ",
+                                scales::comma(diagnosed), 
+                                ")")),
+             hjust = 0, 
+             nudge_x = 0.3, 
+             size = 3.4, 
+             colour = "grey20",
+             fill = "white", 
+             label.size = 0, 
+             label.padding = unit(0.1, "lines")) +
+  annotate("text", x = overall$pct, y = nrow(by_county) + 0.75,
+           label = paste0("All counties: ", round(overall$pct, 1), "%"),
+           hjust = -0.05, size = 3.3, colour = "grey30") +
+
+  # Colours and legend text for the two groups
+  scale_fill_manual(
+    values = c("FALSE" = "#2a78d6", "TRUE" = "#a9c9f0"),
+    labels = c("FALSE" = "100 or more patients",
+               "TRUE"  = "Fewer than 100 patients: interpret with caution"),
+    name   = NULL
+  ) +
+
+  # x-axis: start at 0, show % sign, leave room on the right for the labels
+  scale_x_continuous(labels = function(x) paste0(x, "%"),
+                     limits = c(0, 33),
+                     expand = expansion(mult = c(0, 0))) +
+
+  # Extra space above the top bar so the reference-line label fits
+  scale_y_discrete(expand = expansion(add = c(0.6, 1.2))) +
+
+  # All the text a reader needs
+  labs(
+    title    = "Share of diagnosed COVID-19 patients admitted to hospital, by county",
+    subtitle = "n = number of patients diagnosed with COVID-19 in the county",
+    x        = "Patients admitted to hospital for COVID-19 (%)",
+    y        = NULL,   # county names are self-explanatory, so no axis title
+    caption  = "Source: Synthea COVID-19 10K synthetic dataset (Massachusetts, USA). Diagnoses 20 Jan to 30 Mar 2020.\nAdmission = encounter coded 'Hospital admission for isolation' for COVID-19. Synthetic data: for training only."
+  ) +
+
+  # A clean theme with readable text
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title.position = "plot",              # align title with the left edge
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "grey30", size = 10),
+    plot.caption  = element_text(colour = "grey40", size = 8, hjust = 0),
+    legend.position = "top",
+    legend.justification = "left",
+    panel.grid.major.y = element_blank(),      # remove horizontal grid lines
+    panel.grid.minor   = element_blank()
+  )
+
+p_county
+```
+
+## Save the graph
+
+`ggsave()` saves a plot to a file. Saving to `outputs/` with a clear file name keeps your work organised and lets you drop the graph into a decision brief later in the week.
+
+```{r save-plot}
+ggsave(
+  filename = "outputs/covid_admission_pct_by_county.png",
+  plot     = p_county,
+  width    = 9, height = 6, dpi = 300, bg = "white"
+)
+```
+
+## Reading the graph
+
+* Overall, about **1 in 5** diagnosed patients (21.2%) were admitted. The dashed line marks this state-wide value, and most counties sit close to it.
+* The top-ranked county (Franklin) and the two lowest (Nantucket and Dukes) are the **three smallest counties** (light bars). Their positions at the top and bottom of the ranking could easily be due to chance.
+* A key message for decision-makers: **a ranked bar chart always produces a "worst" county, even when the differences are small or based on few people.**
+* A percentage is not the same as a **number of beds**. Middlesex had 452 admissions; Franklin had 22. Self-assessment Q5 asks you to graph the counts.
+
+---
+
+# Record a limitation
+
+Every summary has limitations. Naming them is not a weakness; it is what makes your evidence trustworthy and stops a decision-maker over-reading a graph. A useful limitation statement has three parts:
+
+1. **What** the limitation is
+2. **Why** it matters for *this* indicator or decision
+3. **What could be done** about it (now or later)
+
+Common types of limitation for routine health data:
+
+| Type | Question to ask | Example in today's data |
+|------|----------------|------------------------|
+| Representativeness / generalisability | Who is in the data, and who is missing? | Synthetic Massachusetts population, not an African setting |
+| Definition / measurement | Does the code capture what we mean? | Admission = one encounter code; confirmed cases only |
+| Denominator | Is the denominator the right population? | Only *diagnosed* people; undiagnosed infections are invisible, and testing access may differ by county |
+| Comparability | Are groups comparable? | Counties differ in age structure; no adjustment for age |
+| Small numbers | Are numbers big enough? | Nantucket (n = 14) and Dukes (n = 24): one patient changes the percentage by several points |
+| Data quality | Missing, implausible or inconsistent values? | ZIP code missing for almost half of patients (not used here) |
+
+## Write your limitation
+
+Edit the text below to state **one** limitation in your own words, then run the chunk. It saves your limitation, together with the key numbers, to a text file in `outputs/`, so the limitation travels with the graph.
+
+```{r record-limitation}
+# EDIT THIS TEXT: one limitation, in plain language (what, why it matters, what could be done)
+my_limitation <- paste(
+  "The denominator includes only patients with a recorded COVID-19 diagnosis.",
+  "If access to testing differed between counties, the share admitted would be",
+  "higher where only sicker people were tested, so county differences may reflect",
+  "testing patterns rather than true differences in severity or need for beds.",
+  "Comparing testing rates by county would help."
+)
+
+# Combine the indicator definition, the headline result and the limitation
+analysis_note <- c(
+  "R Practical 1: analysis note",
+  paste("Date run:", Sys.Date()),
+  "",
+  "Indicator: % of patients diagnosed with COVID-19 who were admitted to hospital for COVID-19",
+  paste0("Overall: ", overall$admitted, " / ", overall$diagnosed,
+         " = ", round(overall$pct, 1), "%"),
+  paste0("Highest county: ", by_county$county[1], " (",
+         round(by_county$pct[1], 1), "%, n = ", by_county$diagnosed[1], ")"),
+  paste0("Lowest county: ", by_county$county[nrow(by_county)], " (",
+         round(by_county$pct[nrow(by_county)], 1), "%, n = ",
+         by_county$diagnosed[nrow(by_county)], ")"),
+  "",
+  "Limitation:",
+  my_limitation
+)
+
+# Write to a text file and also print it here
+write_lines(analysis_note, "outputs/analysis_note.txt")
+cat(analysis_note, sep = "\n")
+```
+
+
+---
+
+# Self-assessment questions
+
+Try each question on your own first. Click **Show solution** to check your answer. Solutions are one way to do it; other correct code is fine.
+
+## Q1. Inspecting the data
+
+How many different counties are in `covid`, and what percentage of patients have a missing `zip`?
+
+<details><summary>Show solution</summary>
+
+```{r q1-solution}
+covid %>%
+  summarise(
+    n_counties      = n_distinct(county),
+    pct_missing_zip = round(100 * mean(is.na(zip)), 1)
+  )
+```
+
+`mean(is.na(zip))` works because `is.na()` gives `TRUE`/`FALSE`, and the mean of `TRUE`s and `FALSE`s is the proportion of `TRUE`s.
+
+</details>
+
+## Q2. One row per person
+
+Suppose a colleague sends you a file where some patients appear twice. Using `covid` as an example, write code that would tell you whether any `patient_id` appears more than once.
+
+<details><summary>Show solution</summary>
+
+```{r q2-solution}
+covid %>%
+  count(patient_id) %>%     # number of rows per patient
+  filter(n > 1) %>%         # keep patients with more than one row
+  nrow()                    # how many such patients?
+```
+
+The answer is 0 for our file. If it were more than 0, those patients would be counted twice in both the numerator and the denominator, and you would need to find out why before analysing.
+
+</details>
+
+## Q3. Summarise the indicator by sex
+
+Calculate the number diagnosed, number admitted and percentage admitted for females and males.
+
+<details><summary>Show solution</summary>
+
+```{r q3-solution}
+covid %>%
+  group_by(sex) %>%
+  summarise(
+    diagnosed = n(),
+    admitted  = sum(admitted),
+    pct       = round(100 * admitted / diagnosed, 1),
+    .groups   = "drop"
+  )
+```
+
+</details>
+
+## Q4. Make a labelled graph by age group
+
+Using `by_age` from Section 5.5, make a labelled bar chart of the percentage admitted by age group. Include a title, axis labels with units and a caption with the data source.
+
+<details><summary>Show solution</summary>
+
+```{r q4-solution, fig.height = 5}
+ggplot(by_age, aes(x = age_group, y = pct)) +
+  geom_col(fill = "#2a78d6", width = 0.7) +
+  # Label each bar with its percentage, just above the bar
+  geom_text(aes(label = paste0(round(pct, 0), "%")),
+            vjust = -0.4, size = 3.3) +
+  scale_y_continuous(labels = function(x) paste0(x, "%"),
+                     expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title   = "Older COVID-19 patients were far more likely to be admitted",
+    x       = "Age group at diagnosis (years)",
+    y       = "Patients admitted to hospital (%)",
+    caption = "Source: Synthea COVID-19 10K synthetic dataset, Jan to Mar 2020."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title.position = "plot",
+        plot.title = element_text(face = "bold"),
+        panel.grid.major.x = element_blank())
+```
+
+Note: the x-axis here (age groups) has a natural order, so we keep it in that order rather than sorting by value.
+
+</details>
+
+## Q5. Percentage or number?
+
+For planning beds, the **number** of admissions matters as much as the percentage. Make a horizontal bar chart of the **number admitted** by county, ordered from most to fewest. How does the ranking compare with the percentage graph?
+
+<details><summary>Show solution</summary>
+
+```{r q5-solution, fig.height = 5.5}
+ggplot(by_county, aes(x = admitted, y = fct_reorder(county, admitted))) +
+  geom_col(fill = "#2a78d6", width = 0.7) +
+  geom_text(aes(label = admitted), hjust = -0.2, size = 3.3) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title   = "Number of COVID-19 hospital admissions, by county",
+    x       = "Patients admitted to hospital for COVID-19 (number)",
+    y       = NULL,
+    caption = "Source: Synthea COVID-19 10K synthetic dataset, Jan to Mar 2020."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title.position = "plot",
+        plot.title = element_text(face = "bold"),
+        panel.grid.major.y = element_blank())
+```
+
+The ranking is completely different. Middlesex has the most admissions by far because it has the most patients, even though its percentage is close to average. Franklin, top of the percentage ranking, has one of the smallest numbers of admissions. Which graph you show depends on the decision: the number tells you about **volume of beds**, the percentage about **how often** diagnosed patients needed admission.
+
+</details>
+
+## Q6. Interpretation
+
+The coordinator says: "Franklin has the highest percentage, so it needs the most extra beds." Give two reasons why this conclusion does not follow from our graph.
+
+<details><summary>Show solution</summary>
+
+Any two of these (or other sensible points):
+
+* **Percentage is not the same as volume.** Bed need depends on the *number* admitted (see Q5). Franklin had 22 admissions; Middlesex had 452.
+* **Small numbers.** Franklin has only 89 patients. One extra admission changes its percentage by more than 1 point, so its top position could be chance.
+* **Age.** Counties with older patients will have higher admission percentages even if care and severity are similar.
+* **Denominator and testing.** Differences in who gets tested change the denominator.
+* **Synthetic data / different setting.** These figures are simulated and from a US state; they should not guide real decisions.
+
+</details>
+
+## Q7. Write a limitation
+
+Write a three-part limitation (what, why it matters, what could be done) for comparing the admission percentage between **females and males** (Q3).
+
+<details><summary>Show solution</summary>
+
+One possible answer: *"The comparison by sex does not take age into account. If one sex has an older age distribution among diagnosed patients, its admission percentage will be higher for that reason alone. Presenting the percentages within age groups would show whether the difference remains."*
+
+</details>
+
+---
+
+# Frequently asked questions (FAQs)
+
+**R says `Error: 'data/covid_patients.csv' does not exist in current working directory`.**
+R cannot find the file. Check that (1) you opened the project by double-clicking `r-practical-1.Rproj` (the project name should show at the top right of RStudio), (2) the file is in the `data` folder, and (3) the file name is spelled exactly the same, including `.csv`. Run `getwd()` to see where R is looking and `list.files("data")` to see what is in the folder.
+
+**`Error in library(tidyverse): there is no package called 'tidyverse'`.**
+Run `install.packages("tidyverse")` once in the Console, then run `library(tidyverse)` again. If installation fails on a slow connection, install only what we use: `install.packages(c("readr", "dplyr", "tidyr", "ggplot2", "lubridate", "stringr", "forcats"))` and load each with `library()`.
+
+**What is the difference between `%>%` and `|>`?**
+Both are "pipes" that pass the result on the left into the function on the right. `%>%` comes from the `magrittr` package (loaded with the tidyverse) and is what we use in this course. `|>` is built into R since version 4.1. For everything we do this week they behave the same.
+
+**Why was the data combined for us? Shouldn't we learn to do it ourselves?**
+Yes, and you will: Day 2 Practical 2B is all about joining and auditing files. Today we focus on inspecting, summarising and visualising. Section 1.5 shows exactly how the file was made, so nothing is hidden.
+
+**`sum(admitted)` gives a count. How?**
+R treats `TRUE` as 1 and `FALSE` as 0 when doing arithmetic. Adding them up counts the `TRUE`s; taking the mean gives the proportion of `TRUE`s.
+
+**Why did you flag counties with fewer than 100 patients? Is 100 a rule?**
+No. It is a simple rule of thumb for this practical, chosen to make the point that percentages from small numbers are unstable. In practice, the right threshold depends on the indicator and the decision. Showing `n` next to every percentage is always good practice.
+
+**What about confidence intervals?**
+Confidence intervals are the formal way to show how much a percentage might vary by chance. We have left them out today to keep the focus on inspecting, summarising and labelling. Uncertainty comes back on Day 4.
+
+**My graph's bars are in alphabetical order.**
+Wrap the category in `fct_reorder()`, for example `y = fct_reorder(county, pct)`, to order by value. For categories with a natural order (age groups, months), keep that order instead.
+
+**The labels at the end of the bars are cut off.**
+Increase the upper limit of the x-axis, for example `limits = c(0, 40)` inside `scale_x_continuous()`, or make the plot wider in `ggsave()`.
+
+**I see a warning about `label.size` when I draw the graph.**
+In the newest versions of `ggplot2` this argument of `geom_label()` has been renamed. The warning is harmless: the graph is still drawn correctly.
+
+**The text on my graph is overlapping.**
+Make the plot window larger, or change the size in `ggsave()` (`width`, `height`). Use `\n` inside a title or caption to break a long line.
+
+**Why use synthetic data instead of real data from our countries?**
+Synthetic data can be shared openly with a whole class without any privacy or ethics approvals, and everyone gets identical results, which makes teaching and troubleshooting easier. The trade-off is realism. In the BYOP clinics you will apply the same steps to data from your own setting.
+
+**Knitting fails but every chunk runs on its own.**
+Knitting starts a fresh R session and runs the file from top to bottom. A common cause is an object you created in the Console that is not created anywhere in the file. Restart R (**Session → Restart R**) and run all chunks in order (**Run → Run All**) to find the problem.
+
+---
+
+# Session information {-}
+
+Recording the R and package versions is part of reproducibility.
+
+```{r session-info}
+sessionInfo()
+```
