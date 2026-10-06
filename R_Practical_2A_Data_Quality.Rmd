@@ -1,0 +1,647 @@
+---
+title: "R Practical 2A: Diagnosing Data-Quality Problems"
+subtitle: "Completeness, timeliness, consistency and outliers in routine health data"
+author: "Discipline of Statistics, UKZN"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 9, fig.height = 5, fig.align = "center"
+)
+```
+
+# Session overview
+
+Routine health information systems (e.g. DHIS2) are only useful if the data going into them can be trusted. In this practical you will **diagnose** data quality, not fix it. By the end you should be able to:
+
+1. Calculate **completeness** (reporting and data-element) and **timeliness**.
+2. Check **internal consistency** between related indicators.
+3. Check **temporal consistency** (gaps, sudden level shifts, spikes).
+4. **Flag outliers** using robust statistics.
+5. **Visualise** missingness and anomalies so a programme manager can act on them.
+
+| Block | Content | Suggested time |
+|---|---|---|
+| 1 | Data, structure, duplicates | 15 min |
+| 2 | Completeness | 20 min |
+| 3 | Timeliness | 15 min |
+| 4 | Consistency between related indicators | 20 min |
+| 5 | Temporal consistency | 20 min |
+| 6 | Outlier detection | 20 min |
+| 7 | Visualising missingness and anomalies | 20 min |
+| 8 | Scorecard and reflection | 10 min |
+
+> **Data note.** To keep the practical self-contained, we *simulate* monthly facility data that mimic a DHIS2 extract, with data-quality problems deliberately injected. Section 9 shows how to swap in your own data.
+
+## Packages
+
+```{r install, eval=FALSE}
+# Run once if needed
+install.packages(c("tidyverse", "lubridate", "naniar", "scales", "knitr"))
+```
+
+```{r packages}
+library(tidyverse)
+library(lubridate)
+library(naniar)   # missing-data visualisation
+library(scales)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 12))
+pct <- label_percent(accuracy = 0.1)
+```
+
+## Parameters (edit these, not the code)
+
+Data-quality thresholds are *programme decisions*. The values below are teaching defaults.
+
+```{r params}
+deadline_days        <- 15     # report due 15 days after month end
+completeness_target  <- 0.80   # e.g. 80% reporting completeness target
+timeliness_target    <- 0.80
+robust_z_cutoff      <- 3.5    # modified z-score cut-off (Iglewicz & Hoaglin)
+level_ratio_bounds   <- c(0.5, 2)     # value / facility median outside this = suspicious
+deliv_anc_bounds     <- c(0.4, 1.6)   # plausible deliveries : ANC1 ratio
+
+indicators <- c("opd_total", "anc1", "anc4", "penta1", "penta3", "deliveries")
+```
+
+# Data, structure and duplicates
+
+## Simulate a DHIS2-like extract
+
+```{r simulate}
+set.seed(2026)
+
+facilities <- tibble(
+  facility_id = sprintf("F%03d", 1:40),
+  district    = rep(paste("District", LETTERS[1:4]), each = 10),
+  catchment   = rlnorm(40, log(300), 0.5)
+)
+months <- seq(ymd("2022-01-01"), ymd("2024-12-01"), by = "month")
+
+dat <- expand_grid(facilities, period = months) %>%
+  mutate(
+    season     = 1 + 0.2 * sin(2 * pi * (month(period) - 1) / 12),
+    opd_total  = rpois(n(), catchment * season * 5),
+    anc1       = rpois(n(), catchment * season * 0.15),
+    anc4       = rbinom(n(), anc1, 0.65),
+    penta1     = rpois(n(), catchment * 0.12),
+    penta3     = rbinom(n(), penta1, 0.90),
+    deliveries = rbinom(n(), anc1 + 5, 0.80)
+  ) %>%
+  select(-season)
+
+# ---- Reporting behaviour and submission dates ----
+dat <- dat %>%
+  mutate(
+    p_report  = if_else(district == "District C", 0.75, 0.93),
+    p_report  = if_else(period == ymd("2023-03-01"), p_report - 0.30, p_report),
+    reported  = rbinom(n(), 1, p_report) == 1,
+    # facility F007 stops reporting altogether after June 2023
+    reported  = if_else(facility_id == "F007" & period > ymd("2023-06-01"), FALSE, reported),
+    month_end = ceiling_date(period, "month") - days(1),
+    deadline  = month_end + days(deadline_days),
+    days_after = round(rgamma(n(), shape = 2,
+                              scale = if_else(district == "District B", 9, 6))),
+    submitted_date = if_else(reported, month_end + days(days_after), as.Date(NA))
+  ) %>%
+  select(-p_report, -days_after)
+
+# ---- Missing values: whole report missing, plus random item-level missingness ----
+dat <- dat %>%
+  mutate(across(all_of(indicators), as.numeric)) %>%
+  mutate(across(all_of(indicators),
+                ~ if_else(!reported | runif(n()) < 0.04, NA_real_, .x))) %>%
+  mutate(anc4 = if_else(district == "District D" & runif(n()) < 0.15, NA_real_, anc4))
+```
+
+```{r inject}
+# ---- Inject known problems (we keep a 'truth' label ONLY because this is a simulation) ----
+dat$truth <- NA_character_
+pick <- function(cols, n) sample(which(dat$reported & complete.cases(dat[cols])), n)
+
+i <- pick("opd_total", 5);  dat$opd_total[i]  <- dat$opd_total[i] * 10;  dat$truth[i] <- "extreme value"
+i <- pick("anc1", 5);       dat$anc1[i]       <- dat$anc1[i] * 10;       dat$truth[i] <- "extreme value"
+i <- pick("deliveries", 3); dat$deliveries[i] <- -(abs(dat$deliveries[i]) + 1); dat$truth[i] <- "negative value"
+i <- pick(c("penta1", "penta3"), 10)
+dat$penta3[i] <- dat$penta1[i] + sample(5:20, 10, replace = TRUE); dat$truth[i] <- "penta3 > penta1"
+i <- pick(c("anc1", "anc4"), 10)
+dat$anc4[i] <- dat$anc1[i] + sample(5:15, 10, replace = TRUE);     dat$truth[i] <- "anc4 > anc1"
+
+# Level shift: F012 OPD collapses to ~20% for six months
+shift <- dat$facility_id == "F012" & dat$period >= ymd("2023-09-01") &
+  dat$period <= ymd("2024-02-01") & dat$reported
+dat$opd_total[shift] <- round(dat$opd_total[shift] * 0.2)
+dat$truth[shift & !is.na(dat$opd_total)] <- "level shift"
+
+# Duplicate rows (double entry)
+dat <- bind_rows(dat, dat %>% filter(reported) %>% slice_sample(n = 6)) %>%
+  arrange(facility_id, period)
+```
+
+## First look
+
+```{r glimpse}
+glimpse(dat)
+```
+
+```{r summary}
+dat %>% select(all_of(indicators)) %>% summary()
+```
+
+**Question:** Is anything already suspicious in the `Min.` and `Max.` columns?
+
+## Duplicates
+
+```{r duplicates}
+dup_keys <- dat %>% count(facility_id, period) %>% filter(n > 1)
+dup_keys
+
+# Decision rule for this practical: keep the first record per facility-month.
+# In real work, first check whether duplicates are identical or conflicting.
+dat <- dat %>% distinct(facility_id, period, .keep_all = TRUE)
+nrow(dat)   # should be 40 facilities x 36 months = 1440
+```
+
+> **Real-data warning.** Our grid is complete (every facility has a row for every month). In real extracts, non-reporting often means *no row at all*. Use `tidyr::complete(facility_id, period)` first so that missing reports are visible.
+
+# Completeness
+
+Two different questions:
+
+- **Reporting completeness**: did the facility submit a report? (`received / expected`)
+- **Data-element completeness**: within the expected reports, is each indicator filled in?
+
+## Reporting completeness
+
+```{r reporting-completeness}
+completeness_by <- function(df, ...) {
+  df %>%
+    group_by(...) %>%
+    summarise(
+      expected_reports = n(),
+      received_reports = sum(!is.na(submitted_date)),
+      reporting_completeness = received_reports / expected_reports,
+      .groups = "drop"
+    )
+}
+
+completeness_by(dat) %>% mutate(reporting_completeness = pct(reporting_completeness))
+completeness_by(dat, district) %>% mutate(reporting_completeness = pct(reporting_completeness))
+```
+
+```{r completeness-trend}
+rep_month_district <- completeness_by(dat, period, district)
+
+ggplot(rep_month_district, aes(period, reporting_completeness, colour = district)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = completeness_target, linetype = "dashed") +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(title = "Reporting completeness by district", x = NULL, y = "Reporting completeness",
+       caption = "Dashed line = target")
+```
+
+**Facilities below target:**
+
+```{r low-facilities}
+completeness_by(dat, facility_id, district) %>%
+  filter(reporting_completeness < completeness_target) %>%
+  arrange(reporting_completeness) %>%
+  mutate(reporting_completeness = pct(reporting_completeness))
+```
+
+## Data-element completeness
+
+We compute it two ways. The first counts non-reporting facilities as missing (the programme view). The second conditions on a report having been received (the data-entry view).
+
+```{r element-completeness}
+dat_long <- dat %>%
+  select(facility_id, district, period, submitted_date, all_of(indicators)) %>%
+  pivot_longer(all_of(indicators), names_to = "indicator", values_to = "value")
+
+element_completeness <- dat_long %>%
+  group_by(indicator) %>%
+  summarise(
+    expected            = n(),
+    non_missing         = sum(!is.na(value)),
+    completeness_all    = non_missing / expected,
+    completeness_if_reported = non_missing / sum(!is.na(submitted_date)),
+    .groups = "drop"
+  )
+
+element_completeness %>%
+  mutate(across(starts_with("completeness"), pct)) %>%
+  kable()
+```
+
+**Question:** Which indicator has the lowest data-element completeness among submitted reports? Which district is driving it?
+
+```{r anc4-by-district}
+dat_long %>%
+  filter(!is.na(submitted_date)) %>%
+  group_by(district, indicator) %>%
+  summarise(completeness = mean(!is.na(value)), .groups = "drop") %>%
+  ggplot(aes(indicator, district, fill = completeness)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = pct(completeness)), size = 3.2) +
+  scale_fill_gradient(low = "#d1495b", high = "#2a9d8f", limits = c(0.7, 1), oob = squish) +
+  labs(title = "Data-element completeness among submitted reports", x = NULL, y = NULL)
+```
+
+> **Zero vs missing.** A blank is not a zero. Whether a facility that saw no cases should enter `0` or leave the field blank is a *reporting-policy* question. Check the data dictionary before you compute completeness.
+
+# Timeliness
+
+A report is **on time** if submitted on or before `deadline` (here, 15 days after month end).
+
+```{r timeliness}
+dat <- dat %>%
+  mutate(
+    days_late = as.numeric(submitted_date - deadline),      # negative = early
+    on_time   = !is.na(submitted_date) & submitted_date <= deadline
+  )
+
+timeliness_by <- function(df, ...) {
+  df %>%
+    group_by(...) %>%
+    summarise(
+      expected_reports  = n(),
+      received_reports  = sum(!is.na(submitted_date)),
+      on_time_reports   = sum(on_time),
+      timeliness_expected = on_time_reports / expected_reports,
+      timeliness_received = on_time_reports / received_reports,
+      median_days_vs_deadline = median(days_late, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+timeliness_by(dat, district) %>%
+  mutate(across(starts_with("timeliness"), pct)) %>%
+  kable()
+```
+
+Two denominators, two stories: `timeliness_expected` penalises non-reporting, whereas `timeliness_received` isolates lateness. State which one you use.
+
+```{r timeliness-plots}
+ggplot(dat %>% filter(!is.na(days_late)), aes(days_late, fill = district)) +
+  geom_histogram(binwidth = 3, colour = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(~ district) +
+  labs(title = "Submission date relative to deadline", x = "Days after deadline (negative = early)",
+       y = "Reports") +
+  theme(legend.position = "none")
+
+timeliness_by(dat, period, district) %>%
+  ggplot(aes(period, timeliness_expected, colour = district)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = timeliness_target, linetype = "dashed") +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(title = "Timeliness by district", x = NULL, y = "Reports on time / expected")
+```
+
+Sanity check on the dates themselves:
+
+```{r date-checks}
+# A report cannot be submitted before the reporting month has ended
+sum(dat$submitted_date < dat$month_end, na.rm = TRUE)
+```
+
+# Consistency between related indicators
+
+Some indicators are logically or epidemiologically linked. Violations do not tell you *which* number is wrong, only that at least one is.
+
+| Rule | Type |
+|---|---|
+| `penta3 <= penta1` | Hard logical rule (you cannot give dose 3 without dose 1) |
+| `anc4 <= anc1` | Hard logical rule |
+| No negative counts | Hard validity rule |
+| Deliveries / ANC1 within a plausible range | Soft, programme-based rule |
+
+```{r consistency}
+dat <- dat %>%
+  mutate(
+    flag_penta    = !is.na(penta1) & !is.na(penta3) & penta3 > penta1,
+    flag_anc      = !is.na(anc1)   & !is.na(anc4)   & anc4 > anc1,
+    flag_negative = if_any(all_of(indicators), ~ !is.na(.x) & .x < 0),
+    deliv_anc_ratio = if_else(!is.na(anc1) & anc1 >= 10 & !is.na(deliveries),
+                              deliveries / anc1, NA_real_),
+    flag_ratio    = !is.na(deliv_anc_ratio) &
+      (deliv_anc_ratio < deliv_anc_bounds[1] | deliv_anc_ratio > deliv_anc_bounds[2])
+  )
+
+dat %>%
+  summarise(across(c(flag_penta, flag_anc, flag_negative, flag_ratio), sum)) %>%
+  pivot_longer(everything(), names_to = "rule", values_to = "records_violating") %>%
+  kable()
+```
+
+```{r consistency-plot}
+ggplot(dat %>% filter(!is.na(penta1), !is.na(penta3), penta1 >= 0, penta3 >= 0),
+       aes(penta1, penta3, colour = flag_penta)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  scale_colour_manual(values = c(`FALSE` = "grey60", `TRUE` = "#d1495b"),
+                      labels = c("Consistent", "Penta3 > Penta1"), name = NULL) +
+  labs(title = "Penta1 vs Penta3", subtitle = "Points above the dashed line are logically impossible",
+       x = "Penta1", y = "Penta3")
+```
+
+**Facilities with repeated violations:**
+
+```{r consistency-facilities}
+dat %>%
+  group_by(facility_id, district) %>%
+  summarise(violations = sum(flag_penta | flag_anc | flag_negative | flag_ratio), .groups = "drop") %>%
+  filter(violations > 0) %>%
+  arrange(desc(violations)) %>%
+  head(10)
+```
+
+# Temporal consistency
+
+Do facility values behave plausibly over time? We look at three things: gaps in reporting, month-on-month change, and departure from the facility's own typical level.
+
+## Reporting gaps and dropouts
+
+```{r gaps}
+last_period <- max(dat$period)
+
+series_status <- dat %>%
+  filter(!is.na(submitted_date)) %>%
+  group_by(facility_id, district) %>%
+  summarise(
+    first_report = min(period),
+    last_report  = max(period),
+    n_reports    = n(),
+    span_months  = interval(first_report, last_report) %/% months(1) + 1,
+    gaps_within_span = span_months - n_reports,
+    stopped_reporting = last_report < last_period,
+    .groups = "drop"
+  )
+
+series_status %>% filter(stopped_reporting) %>% kable(caption = "Facilities that stopped reporting")
+series_status %>% arrange(desc(gaps_within_span)) %>% head(8)
+```
+
+## Level shifts and spikes
+
+```{r temporal}
+dat <- dat %>%
+  arrange(facility_id, period) %>%     # assumes a complete monthly grid (see earlier warning)
+  group_by(facility_id) %>%
+  mutate(
+    fac_median_opd  = median(opd_total[opd_total >= 0], na.rm = TRUE),
+    ratio_to_median = opd_total / fac_median_opd,
+    prev_opd        = lag(opd_total),
+    mom_change      = if_else(!is.na(prev_opd) & prev_opd > 0,
+                              (opd_total - prev_opd) / prev_opd, NA_real_),
+    flag_level      = !is.na(ratio_to_median) &
+      (ratio_to_median < level_ratio_bounds[1] | ratio_to_median > level_ratio_bounds[2]),
+    # sustained departure (adjacent flagged month) = level shift; isolated = spike
+    flag_shift      = flag_level & (lag(flag_level, default = FALSE) | lead(flag_level, default = FALSE)),
+    flag_spike      = flag_level & !flag_shift
+  ) %>%
+  ungroup()
+
+dat %>% summarise(spikes = sum(flag_spike), shifts = sum(flag_shift)) %>% kable()
+```
+
+```{r mom-plot}
+ggplot(dat %>% filter(!is.na(mom_change)), aes(mom_change)) +
+  geom_histogram(binwidth = 0.05, fill = "steelblue", colour = "white") +
+  coord_cartesian(xlim = c(-1, 2)) +
+  scale_x_continuous(labels = percent) +
+  labs(title = "Month-on-month change in OPD attendance",
+       subtitle = "Long right tail = spikes; large negative values = sudden drops",
+       x = "Month-on-month change", y = "Facility-months")
+```
+
+**Question:** Seasonal variation is built into these data. Why is comparing each month with the *facility's median* alone imperfect? How could you improve it (hint: compare with the same month in other years)?
+
+# Outlier detection
+
+We use the **modified z-score**, which relies on the median and MAD rather than the mean and SD, so that the outliers themselves do not distort the yardstick:
+
+$$M_i = \frac{0.6745\,(x_i - \tilde{x})}{\mathrm{MAD}}, \qquad \text{flag if } |M_i| > 3.5$$
+
+We apply it *within each facility and indicator*, since a "large" value for a small clinic is normal for a hospital. Impossible (negative) values are excluded from the reference statistics; they are handled by the validity rule above.
+
+```{r outliers}
+dat_long <- dat_long %>%
+  group_by(facility_id, indicator) %>%
+  mutate(
+    med      = median(value[value >= 0], na.rm = TRUE),
+    mad_val  = mad(value[value >= 0], constant = 1, na.rm = TRUE),
+    robust_z = if_else(!is.na(mad_val) & mad_val > 0, 0.6745 * (value - med) / mad_val, NA_real_),
+    flag_outlier = !is.na(robust_z) & abs(robust_z) > robust_z_cutoff,
+    # classical IQR rule for comparison
+    q1 = quantile(value, 0.25, na.rm = TRUE),
+    q3 = quantile(value, 0.75, na.rm = TRUE),
+    flag_iqr = !is.na(value) & (value < q1 - 1.5 * (q3 - q1) | value > q3 + 1.5 * (q3 - q1))
+  ) %>%
+  ungroup()
+
+dat_long %>%
+  group_by(indicator) %>%
+  summarise(
+    values_checked = sum(!is.na(value)),
+    flagged_modified_z = sum(flag_outlier),
+    flagged_iqr = sum(flag_iqr),
+    .groups = "drop"
+  ) %>%
+  kable()
+```
+
+```{r outlier-join}
+outlier_rows <- dat_long %>%
+  group_by(facility_id, period) %>%
+  summarise(flag_outlier = any(flag_outlier), .groups = "drop")
+
+dat <- dat %>%
+  left_join(outlier_rows, by = c("facility_id", "period")) %>%
+  mutate(flag_outlier = coalesce(flag_outlier, FALSE))
+
+dat_long %>% filter(flag_outlier) %>% arrange(desc(abs(robust_z))) %>%
+  select(facility_id, period, indicator, value, med, robust_z) %>% head(10)
+```
+
+**Discussion:** A flagged value is a *query*, not an error. Some flags will be genuine surges (e.g. an outbreak or campaign). Some Poisson noise in small counts will also cross the threshold. What would you do next with each flagged value in a real system?
+
+# Visualising missingness and anomalies
+
+## Missingness overview
+
+```{r vis-miss, fig.height=5}
+vis_miss(dat %>% select(all_of(indicators), submitted_date), warn_large_data = FALSE) +
+  labs(title = "Missingness across indicators and submission date")
+```
+
+```{r miss-var}
+gg_miss_var(dat %>% select(all_of(indicators)), show_pct = TRUE) +
+  labs(title = "Percentage missing by indicator")
+```
+
+## Reporting heatmap: who reported, when, and how promptly?
+
+```{r heatmap, fig.height=8}
+status_df <- dat %>%
+  mutate(status = case_when(
+    is.na(submitted_date) ~ "Not reported",
+    on_time               ~ "On time",
+    TRUE                  ~ "Late"
+  ),
+  status = factor(status, levels = c("On time", "Late", "Not reported")))
+
+ggplot(status_df, aes(period, facility_id, fill = status)) +
+  geom_tile(width = 31, height = 0.9) +
+  facet_grid(district ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_manual(values = c("On time" = "#2a9d8f", "Late" = "#e9c46a", "Not reported" = "#d1495b"),
+                    name = NULL) +
+  labs(title = "Reporting status by facility and month", x = NULL, y = NULL) +
+  theme(axis.text.y = element_text(size = 6), legend.position = "top")
+```
+
+**Question:** What do you notice in March 2023? What about F007? Which district has a timeliness rather than a completeness problem?
+
+## Anomalies in time series
+
+```{r anomaly-series, fig.height=7}
+opd_flags <- dat_long %>%
+  filter(indicator == "opd_total") %>%
+  select(facility_id, period, opd_outlier = flag_outlier)
+
+dat <- dat %>% left_join(opd_flags, by = c("facility_id", "period"))
+
+flag_cols <- c("flag_penta", "flag_anc", "flag_negative", "flag_ratio",
+               "flag_spike", "flag_shift", "flag_outlier")
+dat <- dat %>% mutate(flag_any = if_any(all_of(flag_cols)))
+
+top_fac <- dat %>%
+  group_by(facility_id) %>%
+  summarise(n_flags = sum(flag_any), .groups = "drop") %>%
+  slice_max(n_flags, n = 6, with_ties = FALSE) %>%
+  pull(facility_id)
+
+dat %>%
+  filter(facility_id %in% top_fac) %>%
+  mutate(anomaly = coalesce(opd_outlier, FALSE) | flag_level) %>%
+  ggplot(aes(period, opd_total)) +
+  geom_line(colour = "grey50", na.rm = TRUE) +
+  geom_point(aes(colour = anomaly), size = 1.8, na.rm = TRUE) +
+  scale_colour_manual(values = c(`FALSE` = "grey40", `TRUE` = "#d1495b"),
+                      labels = c("Not flagged", "Flagged"), name = NULL) +
+  facet_wrap(~ facility_id, scales = "free_y", ncol = 2) +
+  labs(title = "OPD attendance for the six most-flagged facilities",
+       subtitle = "Gaps in the line = missing reports", x = NULL, y = "OPD total")
+```
+
+## What kinds of problems are most common?
+
+```{r flag-summary}
+dat %>%
+  summarise(across(all_of(flag_cols), ~ sum(.x, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "check", values_to = "n_flagged") %>%
+  ggplot(aes(reorder(check, n_flagged), n_flagged)) +
+  geom_col(fill = "#264653") +
+  coord_flip() +
+  labs(title = "Number of flagged facility-months by check", x = NULL, y = "Flagged records")
+```
+
+# Data-quality scorecard
+
+Combine the dimensions into one table a district manager can read.
+
+```{r scorecard}
+elem_district <- dat_long %>%
+  group_by(district) %>%
+  summarise(data_completeness = mean(!is.na(value)), .groups = "drop")
+
+scorecard <- dat %>%
+  group_by(district) %>%
+  summarise(
+    reporting_completeness = mean(!is.na(submitted_date)),
+    timeliness             = mean(on_time),
+    consistency            = 1 - sum(flag_penta | flag_anc | flag_negative | flag_ratio) /
+                                 sum(!is.na(submitted_date)),
+    outlier_free           = 1 - sum(flag_outlier | flag_level) / sum(!is.na(submitted_date)),
+    .groups = "drop"
+  ) %>%
+  left_join(elem_district, by = "district") %>%
+  select(district, reporting_completeness, data_completeness, timeliness, consistency, outlier_free)
+
+scorecard %>%
+  mutate(across(where(is.numeric), pct)) %>%
+  kable(caption = "Data-quality scorecard by district (share of records meeting each criterion)")
+```
+
+```{r scorecard-plot}
+scorecard %>%
+  pivot_longer(-district, names_to = "dimension", values_to = "score") %>%
+  ggplot(aes(dimension, district, fill = score)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = pct(score)), size = 3.2) +
+  scale_fill_gradient(low = "#d1495b", high = "#2a9d8f", limits = c(0.5, 1), oob = squish) +
+  labs(title = "Scorecard heatmap", x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+```
+
+## Reflection: how well did our checks perform?
+
+This is only possible because *we* injected the problems. With real data there is no `truth` column, which is exactly why several complementary checks are needed.
+
+```{r reflection}
+dat %>%
+  mutate(truth = coalesce(truth, "no injected problem")) %>%
+  group_by(truth) %>%
+  summarise(records = n(), flagged = sum(flag_any), share_flagged = pct(flagged / records)) %>%
+  kable(caption = "Share of records flagged, by injected problem (last row = false-positive rate)")
+```
+
+**Discuss:** Which problem types were caught reliably? Which were missed, and why? What is the cost of a false positive versus a false negative in a routine reporting system?
+
+```{r export, eval=FALSE}
+# Export a query list for facility follow-up
+dat %>%
+  filter(flag_any) %>%
+  select(facility_id, district, period, all_of(indicators), all_of(flag_cols)) %>%
+  write_csv("flagged_records.csv")
+```
+
+# Using your own data {#own-data}
+
+Rename or map your columns so the objects below exist, then re-run the chunks from Section 2 onward (skip the simulation chunks).
+
+| Object / column | Meaning |
+|---|---|
+| `facility_id`, `district` | Organisation unit and its parent |
+| `period` | First day of the reporting month (Date) |
+| `submitted_date` | Date the report was received (`NA` if not reported) |
+| `deadline` | Reporting deadline for that month |
+| `indicators` | Character vector of your indicator column names |
+
+Then adapt: the consistency rules (which indicators are logically linked in *your* programme), the thresholds in the parameters chunk, and the reference period used for temporal checks.
+
+# Exercises
+
+1. **Tighten the deadline.** Change `deadline_days` to 10. How does district timeliness change, and does the ranking of districts change?
+2. **Completeness by indicator and district.** Produce a heatmap of *data-element completeness relative to expected reports* (not just submitted ones). How does it differ from the one in Section 3?
+3. **New consistency rule.** Add a rule for `anc4 / anc1` dropout (e.g. flag ratios below 0.3 where `anc1 >= 20`). What does it flag?
+4. **Seasonal reference.** Modify Section 5 so that each value is compared with the median of the *same calendar month* in other years. Does it reduce false flags?
+5. **Threshold sensitivity.** Vary `robust_z_cutoff` between 2.5 and 5. Plot the number of flags against the cutoff for each indicator.
+6. **Communicate.** Write three sentences for a district health manager summarising the biggest data-quality problem in District C and what you would ask facilities to do.
+
+# Session information
+
+```{r session}
+sessionInfo()
+```
