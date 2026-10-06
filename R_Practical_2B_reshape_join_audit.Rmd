@@ -1,0 +1,851 @@
+---
+title: "R Practical 2B: Reshape, Join and Audit"
+subtitle: "From messy facility reports to an analysis-ready table with a provenance note"
+author: "Discipline of Statistics, University of KwaZulu-Natal"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: readable
+params:
+  show_solutions: false   # set to true (Knit with Parameters) for the instructor copy
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                      fig.width = 7, fig.height = 4.5)
+library(tidyverse)   # dplyr, tidyr, readr, stringr, lubridate, ggplot2
+options(dplyr.summarise.inform = FALSE)
+stopifnot(packageVersion("dplyr") >= "1.1.0")   # needed for join `relationship =`
+```
+
+# Session overview {-}
+
+| | |
+|---|---|
+| **Duration** | 2 hours (120 minutes) |
+| **Level** | Second-year / early postgraduate; assumes the basics from Practical 2A (importing, `dplyr` verbs, pipes) |
+| **Packages** | `tidyverse` (>= 2.0) with `dplyr` >= 1.1.0 |
+| **Data** | Simulated by the first code chunk, so no downloads are needed. Three CSV files are written to `data/` and treated as "received from the district" |
+
+## Learning outcomes {-}
+
+By the end of this session students should be able to:
+
+1. Reshape facility-level reports between **wide** and **long** formats with `pivot_longer()` and `pivot_wider()`, and explain when each shape is useful.
+2. Standardise **join keys** (case, whitespace, code formats) before joining.
+3. Choose the right join (`left_join`, `inner_join`, `full_join`, `semi_join`, `anti_join`) and state the **expected cardinality** of a join.
+4. **Audit** a dataset for exact duplicates, conflicting duplicates and unmatched records, and decide (and document) a rule for each.
+5. Build an **analysis-ready table** (one row per facility per month) with validation checks and flag columns.
+6. Write a short **provenance note** so that another analyst can reproduce and trust the table.
+
+## Timetable {-}
+
+| Time (min) | Section | Activity |
+|---|---|---|
+| 0–8 | 1. Orientation | The problem, tidy data, the audit mindset |
+| 8–18 | 2. Read and inspect | Import three files, first look, file fingerprints |
+| 18–45 | 3. Reshape | Wide to long, cleaning values, long to wide, **Exercise 1** |
+| 45–55 | 4. Keys | Why joins fail silently; standardising identifiers |
+| 55–60 | *Break* | |
+| 60–70 | 5. Join toolkit | Toy examples, cardinality |
+| 70–90 | 6. Audit | Duplicates, unmatched records, row explosions, **Exercise 2** |
+| 90–105 | 7. Analysis table | Joins, coverage indicators, validation, **Exercise 3** |
+| 105–115 | 8. Provenance note | Generate the note programmatically |
+| 115–120 | 9. Wrap-up | Key messages, take-home task |
+
+> **Instructor note.** Knit this file with `show_solutions = TRUE` (RStudio: *Knit > Knit with Parameters*) for the instructor copy. The student copy hides the solution chunks. Everything else runs identically in both versions. The exercises are built so that the *wrong-looking* first answer is instructive; let students hit the traps before you name them.
+
+# Orientation (8 min)
+
+## The scenario {-}
+
+A provincial health department sends you monthly facility reports for two indicators, together with a facility register and a table of target populations (denominators). You must produce a table that an analyst can use to compute **coverage** without worrying about hidden data problems:
+
+* `anc1`: antenatal first visits
+* `dpt3`: third doses of DPT-containing vaccine
+
+The three inputs:
+
+| File | Content | Shape | Known-unknown |
+|---|---|---|---|
+| `facility_reports_wide.csv` | Counts, one column per month | Wide | Sentinel values, missing values, duplicates, inconsistent IDs |
+| `facility_register.csv` | Facility name, district, type, ownership | One row per facility (supposedly) | Duplicates, conflicts, text inconsistencies |
+| `facility_denominators.csv` | Annual target populations per facility | One row per facility per year (supposedly) | Different ID format, missing facility, two sources |
+
+## Three ideas to carry through the session {-}
+
+1. **Tidy data.** Each variable is a column, each observation a row, each value a cell. Month names stored as column headers violate this: the month is a variable.
+2. **A join is a claim about the data.** `left_join(a, b, by = "id")` silently claims that *every* `id` in `a` appears in `b` and that `b` has *at most one* row per `id`. When the claim is false, R will not tell you unless you ask.
+3. **Every row you drop or change needs a reason on record.** Auditing is not extra work after the analysis; it is the part that makes the analysis defensible.
+
+> **Discussion (2 min).** Ask: "If a join returns more rows than you started with, is that an error?" Take two or three answers before moving on. (It is *not always* an error, but it must be intentional.)
+
+# Set up and read the data (10 min)
+
+## Create the practice data {-}
+
+Run this chunk once. It builds three deliberately messy files.
+
+```{r simulate-data, echo=FALSE}
+set.seed(2026)
+dir.create("data",   showWarnings = FALSE)
+dir.create("output", showWarnings = FALSE)
+
+n_fac     <- 40
+fac_ids   <- sprintf("FAC%03d", 1:n_fac)
+districts <- c("North", "South", "East", "West", "Central")
+months    <- sprintf("2025_%02d", 1:6)
+
+# a "true" size for each facility drives both counts and denominators
+size_tbl <- tibble(facility_id = fac_ids, size = rlnorm(n_fac, log(30), 0.5))
+
+## ---- 1. Facility register --------------------------------------------------
+register <- tibble(
+  facility_id   = fac_ids,
+  facility_name = paste("Facility", 1:n_fac),
+  district      = rep(districts, each = 8),
+  type          = sample(c("Clinic", "CHC", "Hospital"), n_fac, replace = TRUE,
+                         prob = c(.6, .3, .1)),
+  ownership     = sample(c("Public", "NGO"), n_fac, replace = TRUE,
+                         prob = c(.85, .15))
+) %>%
+  # text inconsistencies
+  mutate(district = case_when(facility_id == "FAC001" ~ "north ",
+                              facility_id == "FAC009" ~ "SOUTH",
+                              TRUE ~ district)) %>%
+  # FAC039 and FAC040 report but are missing from the register
+  filter(!facility_id %in% c("FAC039", "FAC040"))
+
+register <- bind_rows(
+  register,
+  register %>% filter(facility_id == "FAC012"),            # exact duplicate
+  register %>% filter(facility_id == "FAC025") %>%         # conflicting duplicate
+    mutate(type = if_else(type == "Clinic", "CHC", "Clinic"))
+)
+
+## ---- 2. Monthly reports (wide) ---------------------------------------------
+reports_wide <- expand_grid(facility_id = fac_ids,
+                            indicator   = c("anc1", "dpt3"),
+                            period      = months) %>%
+  left_join(size_tbl, by = "facility_id") %>%
+  mutate(value = rpois(n(), size * if_else(indicator == "anc1", 1, 0.8))) %>%
+  select(-size) %>%
+  pivot_wider(names_from = period, values_from = value) %>%
+  # FAC005 and FAC022 never report
+  filter(!facility_id %in% c("FAC005", "FAC022")) %>%
+  # inconsistent identifiers
+  mutate(facility_id = case_when(
+    facility_id == "FAC002" & indicator == "dpt3" ~ "fac002",
+    facility_id == "FAC009" & indicator == "anc1" ~ "FAC009 ",
+    TRUE ~ facility_id)) %>%
+  # a sentinel value and a true missing value
+  mutate(`2025_03` = if_else(facility_id == "FAC004" & indicator == "anc1",
+                             -999L, `2025_03`),
+         `2025_05` = if_else(facility_id == "FAC006" & indicator == "dpt3",
+                             NA_integer_, `2025_05`))
+
+reports_wide <- bind_rows(
+  reports_wide,
+  reports_wide %>% filter(facility_id == "FAC013", indicator == "anc1"),  # exact duplicate
+  reports_wide %>% filter(facility_id == "FAC021", indicator == "dpt3") %>%
+    mutate(across(matches("^2025_"), ~ .x + 5L))                          # conflicting duplicate
+)
+
+## ---- 3. Denominators -------------------------------------------------------
+denominators <- size_tbl %>%
+  transmute(org_unit_code        = sub("FAC", "FAC-", facility_id),   # different code format
+            year                 = 2025L,
+            expected_pregnancies = round(size * 12 / runif(n(), .7, 1.1)),
+            expected_infants     = round(size * 0.8 * 12 / runif(n(), .7, 1.1)),
+            source               = "DHIS2") %>%
+  filter(org_unit_code != "FAC-031")                                  # FAC031 missing
+
+denominators <- bind_rows(
+  denominators,
+  denominators %>% filter(org_unit_code == "FAC-008") %>%             # second source
+    mutate(expected_pregnancies = expected_pregnancies + 40, source = "Stats SA")
+)
+
+write_csv(register,     "data/facility_register.csv")
+write_csv(reports_wide, "data/facility_reports_wide.csv")
+write_csv(denominators, "data/facility_denominators.csv")
+```
+
+
+## Read the three files {-}
+
+We read the register as all-character on purpose: identifiers and codes are labels, not numbers, and we do not want R guessing.
+
+```{r read-data}
+reports_raw      <- read_csv("data/facility_reports_wide.csv", show_col_types = FALSE)
+register_raw     <- read_csv("data/facility_register.csv",
+                             col_types = cols(.default = col_character()))
+denominators_raw <- read_csv("data/facility_denominators.csv", show_col_types = FALSE)
+
+glimpse(reports_raw)
+```
+
+Notice the column names `2025_01`, `2025_02`, and so on. They are not syntactic R names (they start with a digit), so you need backticks to refer to them, for example `` reports_raw$`2025_01` ``.
+
+```{r first-look}
+glimpse(register_raw)
+glimpse(denominators_raw)
+count(reports_raw, indicator)
+```
+
+**Quick questions for students (write down your answers).**
+
+1. How many rows does each table have? Is that what you would expect?
+2. In which table is the *month* stored as a variable, and in which as column names?
+3. Which column would you use to link the three tables? Do all three call it the same thing?
+
+## Fingerprint the inputs and start a row-flow log {-}
+
+Before changing anything, record what you received. The `md5` checksum identifies the exact file version; if the department re-sends "the same" file, you can tell whether it has changed.
+
+```{r fingerprint}
+input_files <- c("data/facility_reports_wide.csv",
+                 "data/facility_register.csv",
+                 "data/facility_denominators.csv")
+input_log <- tibble(file = basename(input_files),
+                    md5  = unname(tools::md5sum(input_files)),
+                    rows = c(nrow(reports_raw), nrow(register_raw), nrow(denominators_raw)))
+input_log
+
+# A tiny helper: record how many rows each object has at each step
+flow_log <- tibble(step = character(), rows = integer())
+log_step <- function(step, x) {
+  flow_log <<- add_row(flow_log, step = step, rows = nrow(x))   # <<- for teaching convenience
+  invisible(x)
+}
+log_step("reports_raw (wide)", reports_raw)
+log_step("register_raw",       register_raw)
+log_step("denominators_raw",   denominators_raw)
+```
+
+# Reshape (27 min)
+
+## Wide to long with `pivot_longer()` {-}
+
+Long format has one row per **facility, indicator and month**. This is the natural shape for auditing (duplicate keys become obvious), for plotting, and for modelling.
+
+```{r pivot-longer}
+reports_long <- reports_raw %>%
+  pivot_longer(
+    cols      = matches("^\\d{4}_\\d{2}$"),   # select month columns by pattern
+    names_to  = "period",
+    values_to = "value"
+  ) %>%
+  mutate(period = ym(str_replace(period, "_", "-")))   # "2025_03" -> 2025-03-01 (Date)
+
+log_step("reports_long", reports_long)
+reports_long %>% arrange(facility_id, indicator, period) %>% head(8)
+```
+
+Three things to point out:
+
+* `cols = matches(...)` selects columns by *pattern*, which is safer than typing `` `2025_01`:`2025_06` `` when next month's file has a new column.
+* `names_to` and `values_to` name the two new columns: the old headers become `period`, the old cells become `value`.
+* We converted `period` to a real `Date`. A text period such as `"2025_03"` sorts correctly by accident; a date sorts, plots and does arithmetic correctly by design.
+
+> **Try it.** What happens to the number of rows? Check: `nrow(reports_raw) * 6` versus `nrow(reports_long)`.
+
+**Useful arguments to mention (do not dwell).** `values_drop_na = TRUE` drops the missing cells (but then a missing report is *invisible*, so we do not use it here); `names_pattern` and `names_transform` split and convert headers in one step; `names_sep` handles headers such as `anc1_2025_03` holding two variables.
+
+## Look at the values {-}
+
+```{r inspect-values}
+reports_long %>%
+  summarise(n = n(),
+            n_missing  = sum(is.na(value)),
+            n_negative = sum(value < 0, na.rm = TRUE),
+            min = min(value, na.rm = TRUE),
+            max = max(value, na.rm = TRUE))
+
+reports_long %>% filter(value < 0)
+```
+
+A value of `-999` is a **sentinel**: a code meaning "not reported" that someone typed into a numeric column. If we averaged it, coverage would be wrecked without any error message. We convert it to `NA` in the next section, after the audit of keys, and record how many we changed.
+
+## Long back to wide with `pivot_wider()` {-}
+
+The analysis table needs one column per indicator, so we will need to go back to wide, *partially*. First, a warning worth seeing with your own eyes:
+
+```{r pivot-wider-warning}
+reports_long %>%
+  pivot_wider(names_from = indicator, values_from = value) %>%
+  head(3)
+```
+
+`pivot_wider()` has complained that the values are **not uniquely identified**: at least one facility, period and indicator appears more than once, so a cell would have to hold two values, and R stores them as a list. This is not an inconvenience; it is a free duplicate detector. The trick to find the offenders is `values_fn = length`:
+
+```{r pivot-wider-length}
+reports_long %>%
+  pivot_wider(names_from = indicator, values_from = value, values_fn = length) %>%
+  filter(anc1 > 1 | dpt3 > 1)
+```
+
+We will deal with these rows properly in the audit. For now, remember the rule: **never call `pivot_wider()` on data whose keys you have not checked.**
+
+## Exercise 1 (8 min) {-}
+
+For each facility and indicator, count the number of months with a valid report (not missing and not `-999`), then reshape the result so that there is **one row per facility** with one column per indicator (`months_anc1`, `months_dpt3`).
+
+*Hint:* `na_if()`, `group_by()`, `summarise()`, `pivot_wider(names_prefix = ...)`.
+
+```{r ex1-skeleton, eval=FALSE}
+ex1 <- reports_long %>%
+  mutate(value = ______) %>%
+  group_by(______) %>%
+  summarise(months_valid = ______) %>%
+  pivot_wider(______)
+```
+
+```{r ex1-solution, eval=params$show_solutions, echo=params$show_solutions}
+ex1 <- reports_long %>%
+  mutate(value = na_if(value, -999)) %>%
+  group_by(facility_id, indicator) %>%
+  summarise(months_valid = sum(!is.na(value))) %>%
+  pivot_wider(names_from = indicator, values_from = months_valid,
+              names_prefix = "months_")
+
+ex1 %>% filter(if_any(starts_with("months_"), ~ .x != 6 | is.na(.x)))
+# Discussion: FAC013 shows 12 valid months for anc1 (its rows are duplicated), and
+# fac002 / "FAC009 " appear as separate facilities with only one indicator each.
+# The reshaping was correct; the *data* need auditing. Come back to this after Section 6.
+```
+
+# Keys: why joins fail silently (10 min)
+
+A join matches keys **exactly**. `"FAC002"`, `"fac002"` and `"FAC002 "` are three different keys. Look at the reports against the register *before* any cleaning:
+
+```{r keys-before}
+report_ids <- distinct(reports_long, facility_id)
+
+anti_join(report_ids, register_raw, by = "facility_id")
+```
+
+`anti_join(x, y)` returns the rows of `x` with **no match** in `y`. Two of these are typing problems (`fac002`, `FAC009 `) and two are real (`FAC039`, `FAC040` are simply not in the register). A `left_join()` would have produced `NA` for all four without a word of warning.
+
+## Standardise, then re-check {-}
+
+```{r standardise}
+clean_id <- function(x) x %>% str_squish() %>% str_to_upper()
+
+reports_std <- reports_long %>%
+  mutate(facility_id = clean_id(facility_id),
+         value       = na_if(value, -999))          # sentinel to NA
+
+register_std <- register_raw %>%
+  mutate(facility_id = clean_id(facility_id),
+         district    = str_to_title(str_squish(district)),
+         across(c(type, ownership), str_squish))
+
+denominators_std <- denominators_raw %>%
+  rename(facility_id = org_unit_code) %>%           # same key name in all tables
+  mutate(facility_id = clean_id(str_remove(facility_id, "-")))   # "FAC-001" -> "FAC001"
+
+# how many sentinels did we convert?
+n_sentinel <- sum(reports_long$value == -999, na.rm = TRUE)
+n_sentinel
+
+anti_join(distinct(reports_std, facility_id), register_std, by = "facility_id")
+```
+
+The typing problems are gone; the two genuine gaps remain, and they now show up honestly.
+
+> **Rules of thumb.**
+> (1) Standardise keys in a single function (`clean_id()`) and apply it to *every* table, so that the same fix is used everywhere.
+> (2) Never edit the raw files by hand. Every change lives in code, so it can be re-run when the file is re-sent.
+> (3) Keep the original text if the cleaning could be lossy (for example, if you have to guess a code).
+
+```{r log-standardised, include=FALSE}
+log_step("reports_std (long, standardised)", reports_std)
+```
+
+**Break (5 min).**
+
+# The join toolkit (10 min)
+
+## Toy example {-}
+
+```{r toy-data}
+left  <- tibble(id = c("A", "B", "C"), x = 1:3)
+right <- tibble(id = c("B", "C", "D"), y = c("b", "c", "d"))
+```
+
+```{r toy-joins}
+left_join(left, right,  by = "id")   # keep all of left           (3 rows: A has y = NA)
+inner_join(left, right, by = "id")   # only matches               (2 rows: B, C)
+full_join(left, right,  by = "id")   # keep everything            (4 rows: A, B, C, D)
+semi_join(left, right,  by = "id")   # rows of left WITH a match  (columns of left only)
+anti_join(left, right,  by = "id")   # rows of left with NO match (this is the audit join)
+```
+
+| Join | Keeps | Typical use in this session |
+|---|---|---|
+| `left_join(x, y)` | all of `x`, matching columns of `y` | Attach register and denominators to the reports |
+| `inner_join(x, y)` | only matched rows | Rarely: it hides losses |
+| `full_join(x, y)` | everything from both | Compare two lists of IDs |
+| `semi_join(x, y)` | rows of `x` that have a match | "Which facilities appear in both?" |
+| `anti_join(x, y)` | rows of `x` that have **no** match | **Auditing unmatched records** |
+
+## Cardinality: the silent multiplier {-}
+
+If `right` has *two* rows for `"B"`, then `left_join()` returns two rows for `"B"`:
+
+```{r toy-cardinality}
+right_dup <- bind_rows(right, tibble(id = "B", y = "b-again"))
+
+left_join(left, right_dup, by = "id")            # 4 rows instead of 3: silent!
+
+# ask R to check our expectation: every id in `left` matches at most one row of `right`
+tryCatch(
+  left_join(left, right_dup, by = "id", relationship = "many-to-one"),
+  error = function(e) cat("Caught:", conditionMessage(e), "\n")
+)
+```
+
+The argument `relationship = "many-to-one"` is a **one-line assertion** about the data. Use it every time you attach a lookup table (register, denominators, codes) to a fact table (reports).
+
+> **Note on differently named keys.** If the key columns have different names, use `join_by(facility_id == org_unit_code)`. We avoided this by renaming to `facility_id` in Section 4, but you will meet it constantly in real data.
+
+# Audit (20 min)
+
+We audit each table *before* it is joined. For each problem we decide a **rule** and apply it in code. The rules are the important part; they go in the provenance note.
+
+## Duplicates in the reports {-}
+
+There are two different kinds, and they need different treatment.
+
+* **Exact duplicates**: the whole row is repeated. Harmless to remove.
+* **Conflicting duplicates**: same key (facility, indicator, period) but different values. We *cannot* tell which is right.
+
+```{r audit-report-dups}
+# 1. exact duplicates
+exact_dups <- reports_std %>%
+  count(across(everything()), name = "n_copies") %>%
+  filter(n_copies > 1)
+exact_dups
+
+reports_dedup <- distinct(reports_std)
+
+# 2. conflicting duplicates: same key, different value, after removing exact copies
+conflict_keys <- reports_dedup %>%
+  count(facility_id, indicator, period, name = "n_records") %>%
+  filter(n_records > 1)
+
+reports_dedup %>%
+  semi_join(conflict_keys, by = c("facility_id", "indicator", "period")) %>%
+  arrange(facility_id, indicator, period)
+```
+
+**Rule for reports (documented in the provenance note):**
+
+* exact duplicates are removed;
+* conflicting duplicates are **quarantined**: removed from the analysis table, saved in a separate file, and reported back to the data provider for verification. We do not guess.
+
+```{r quarantine}
+key_cols <- c("facility_id", "indicator", "period")
+
+quarantine_reports <- reports_dedup %>%
+  semi_join(conflict_keys, by = key_cols)
+
+reports_ok <- reports_dedup %>%
+  anti_join(conflict_keys, by = key_cols)
+
+write_csv(quarantine_reports, "output/quarantine_conflicting_reports.csv")
+
+log_step("reports after removing exact duplicates", reports_dedup)
+log_step("reports_ok (conflicts quarantined)",      reports_ok)
+```
+
+## Duplicates in the register {-}
+
+```{r audit-register}
+register_1 <- distinct(register_std)                  # remove exact copies
+
+conflict_ids <- register_1 %>%
+  count(facility_id) %>%
+  filter(n > 1) %>%
+  pull(facility_id)
+conflict_ids
+
+register_1 %>% filter(facility_id %in% conflict_ids)   # what do the conflicting rows disagree on?
+```
+
+**Rule for the register:** exact duplicates are removed. Where records disagree, the disputed attribute (`type`) is set to `NA` and a flag is raised; the facility itself stays in the data because its *counts* are still valid.
+
+```{r resolve-register}
+register_clean <- register_1 %>%
+  mutate(flag_register_conflict = facility_id %in% conflict_ids,
+         type = if_else(flag_register_conflict, NA_character_, type)) %>%
+  distinct(facility_id, .keep_all = TRUE)
+
+stopifnot(!anyDuplicated(register_clean$facility_id))   # one row per facility now
+log_step("register_clean", register_clean)
+```
+
+## Duplicates in the denominators {-}
+
+```{r audit-denominators}
+den_multi <- denominators_std %>%
+  count(facility_id, year) %>%
+  filter(n > 1)
+
+denominators_std %>% semi_join(den_multi, by = c("facility_id", "year"))
+```
+
+Here there is a defensible hierarchy: the routine information system is the official source. **Rule:** prefer `DHIS2`; fall back to `Stats SA`; flag any facility that had more than one source.
+
+```{r resolve-denominators}
+denominators_1 <- denominators_std %>%
+  mutate(source = factor(source, levels = c("DHIS2", "Stats SA"))) %>%
+  arrange(facility_id, year, source) %>%
+  distinct(facility_id, year, .keep_all = TRUE) %>%
+  mutate(source = as.character(source),
+         flag_denominator_multi_source = facility_id %in% den_multi$facility_id)
+
+stopifnot(!anyDuplicated(denominators_1[c("facility_id", "year")]))
+log_step("denominators_1", denominators_1)
+```
+
+> **Discussion.** Why did we resolve the report conflict by quarantine but the denominator conflict by a source hierarchy? (Because for denominators we have a *reason* to prefer one source; for the two report rows we have none.)
+
+## Unmatched records {-}
+
+A single function to summarise how well two tables overlap on the key:
+
+```{r key-check}
+key_check <- function(x, y, x_name, y_name, key = "facility_id") {
+  kx <- x %>% distinct(across(all_of(key)))
+  ky <- y %>% distinct(across(all_of(key)))
+  tibble(x = x_name, y = y_name,
+         keys_x  = nrow(kx),
+         keys_y  = nrow(ky),
+         in_both = nrow(semi_join(kx, ky, by = key)),
+         only_x  = nrow(anti_join(kx, ky, by = key)),
+         only_y  = nrow(anti_join(ky, kx, by = key)))
+}
+
+bind_rows(
+  key_check(reports_ok,     register_clean,  "reports",  "register"),
+  key_check(reports_ok,     denominators_1,  "reports",  "denominators"),
+  key_check(register_clean, denominators_1,  "register", "denominators")
+)
+```
+
+Now list *who* is unmatched, not just how many, and save it:
+
+```{r unmatched-log}
+report_fac <- distinct(reports_ok, facility_id)
+
+unmatched_log <- bind_rows(
+  anti_join(report_fac, register_clean, by = "facility_id") %>%
+    mutate(issue = "in reports, not in register"),
+  anti_join(select(register_clean, facility_id), report_fac, by = "facility_id") %>%
+    mutate(issue = "in register, no reports"),
+  anti_join(report_fac, select(denominators_1, facility_id), by = "facility_id") %>%
+    mutate(issue = "in reports, no denominator")
+) %>% arrange(issue, facility_id)
+
+unmatched_log
+write_csv(unmatched_log, "output/audit_unmatched_records.csv")
+```
+
+## Cardinality check: what would the naive join have done? {-}
+
+```{r naive-join}
+reports_by_period <- reports_ok %>%
+  pivot_wider(names_from = indicator, values_from = value)
+
+naive <- reports_by_period %>%
+  mutate(year = year(period)) %>%
+  left_join(denominators_std, by = c("facility_id", "year"))   # denominators NOT yet de-duplicated
+
+c(rows_before = nrow(reports_by_period), rows_after_naive_join = nrow(naive))
+
+# the safe version stops us at the door:
+tryCatch(
+  reports_by_period %>% mutate(year = year(period)) %>%
+    left_join(denominators_std, by = c("facility_id", "year"), relationship = "many-to-one"),
+  error = function(e) cat("Caught:", conditionMessage(e), "\n")
+)
+```
+
+Six extra rows (one per month for FAC008) would have quietly double-counted that facility in every total. This is the classic way that district totals end up slightly wrong.
+
+## Exercise 2 (in-session, about 5 min) {-}
+
+1. Which facilities are **in the register but have no reports**? Name them and suggest two possible explanations (for example: closed, reports lost, reporting through another facility).
+2. Which **districts** do the facilities with no denominator belong to? (You will need the register.)
+
+```{r ex2-skeleton, eval=FALSE}
+# 1.
+register_clean %>% ______
+
+# 2.
+reports_ok %>% distinct(facility_id) %>% anti_join(______) %>% left_join(______)
+```
+
+```{r ex2-solution, eval=params$show_solutions, echo=params$show_solutions}
+# 1. register but no reports
+register_clean %>%
+  anti_join(distinct(reports_ok, facility_id), by = "facility_id") %>%
+  select(facility_id, facility_name, district, type)
+
+# 2. reporting facilities with no denominator, and their districts
+reports_ok %>%
+  distinct(facility_id) %>%
+  anti_join(denominators_1, by = "facility_id") %>%
+  left_join(select(register_clean, facility_id, district), by = "facility_id")
+```
+
+# Build the analysis-ready table (15 min)
+
+## Join with assertions {-}
+
+`reports_by_period` is the **spine**: one row per facility per month. We attach the register and the denominators with `left_join()`, asserting `many-to-one` each time so that the row count cannot change.
+
+```{r build-analysis-table}
+analysis_table <- reports_by_period %>%
+  mutate(year = year(period)) %>%
+  left_join(register_clean,  by = "facility_id",
+            relationship = "many-to-one") %>%
+  left_join(denominators_1,  by = c("facility_id", "year"),
+            relationship = "many-to-one") %>%
+  mutate(
+    # coverage: monthly count as a % of one-twelfth of the annual target
+    anc1_coverage = 100 * anc1 / (expected_pregnancies / 12),
+    dpt3_coverage = 100 * dpt3 / (expected_infants / 12),
+    # flags: make every problem visible in the table itself
+    flag_no_register          = is.na(facility_name),
+    flag_no_denominator       = is.na(expected_pregnancies),
+    flag_missing_value        = is.na(anc1) | is.na(dpt3),
+    flag_register_conflict    = coalesce(flag_register_conflict, FALSE),
+    flag_denominator_multi_source = coalesce(flag_denominator_multi_source, FALSE),
+    include_in_analysis = !(flag_no_register | flag_no_denominator | flag_missing_value)
+  ) %>%
+  select(facility_id, facility_name, district, type, ownership,
+         period, year, anc1, dpt3, expected_pregnancies, expected_infants,
+         anc1_coverage, dpt3_coverage, source, starts_with("flag_"),
+         include_in_analysis) %>%
+  arrange(facility_id, period)
+
+log_step("analysis_table (facility-months)", analysis_table)
+log_step("analysis_table: include_in_analysis = TRUE", filter(analysis_table, include_in_analysis))
+
+glimpse(analysis_table)
+```
+
+Design choices to discuss:
+
+* We **flag rather than delete**. The analyst can see *why* a row is excluded and can change the rule.
+* `include_in_analysis` is one explicit column, so the exclusion rule is a single, visible line of code.
+* `flag_register_conflict` does **not** exclude a row from coverage analysis (counts and denominators are fine), but it does mean `type` is `NA`, so the row drops out of any analysis stratified by facility type.
+
+## Validation: the table must pass its own tests {-}
+
+```{r validation}
+checks <- tibble(
+  check = c("One row per facility and month",
+            "Row count equals the spine (no join multiplication)",
+            "No negative counts",
+            "No -999 sentinels left",
+            "Denominators positive where present",
+            "District is one of the five standard names (where present)"),
+  passed = c(
+    !anyDuplicated(analysis_table[c("facility_id", "period")]),
+    nrow(analysis_table) == nrow(reports_by_period),
+    all(analysis_table$anc1 >= 0 & analysis_table$dpt3 >= 0, na.rm = TRUE),
+    !any(analysis_table$anc1 == -999 | analysis_table$dpt3 == -999, na.rm = TRUE),
+    all(analysis_table$expected_pregnancies > 0 & analysis_table$expected_infants > 0, na.rm = TRUE),
+    all(analysis_table$district %in% c("North", "South", "East", "West", "Central") |
+          is.na(analysis_table$district))
+  ))
+knitr::kable(checks)
+stopifnot(all(checks$passed))   # the document refuses to knit if the table is broken
+```
+
+The `stopifnot()` at the end is deliberate: a table that fails validation should stop the pipeline, not travel downstream.
+
+## A plausibility check {-}
+
+Coverage above 100% is possible (denominators are estimates) but very high values deserve a look.
+
+```{r plausibility}
+analysis_table %>%
+  filter(include_in_analysis) %>%
+  ggplot(aes(district, anc1_coverage)) +
+  geom_boxplot(outlier.shape = 21) +
+  geom_hline(yintercept = 100, linetype = "dashed") +
+  labs(x = NULL, y = "ANC first visit coverage (% of monthly target)",
+       title = "Monthly facility coverage by district",
+       subtitle = "Included facility-months only") +
+  theme_minimal()
+
+analysis_table %>% filter(include_in_analysis) %>%
+  summarise(n = n(), over_150 = sum(anc1_coverage > 150 | dpt3_coverage > 150))
+```
+
+## Exercise 3 (about 5 min): the aggregation trap {-}
+
+Compute the district ANC1 coverage **two ways** for the included rows and compare:
+
+* (a) the **mean of the facility percentages**;
+* (b) the **ratio of sums**: total ANC1 visits divided by total monthly target.
+
+Which is correct for a district-level indicator, and why?
+
+```{r ex3-skeleton, eval=FALSE}
+analysis_table %>%
+  filter(include_in_analysis) %>%
+  group_by(district) %>%
+  summarise(mean_of_pct = ______, ratio_of_sums = ______)
+```
+
+```{r ex3-solution, eval=params$show_solutions, echo=params$show_solutions}
+analysis_table %>%
+  filter(include_in_analysis) %>%
+  group_by(district) %>%
+  summarise(mean_of_pct   = mean(anc1_coverage),
+            ratio_of_sums = 100 * sum(anc1) / sum(expected_pregnancies / 12),
+            diff          = mean_of_pct - ratio_of_sums)
+# (b) is the district coverage: it weights each facility by the size of its target
+# population. (a) gives a small clinic the same say as a large hospital.
+```
+
+## Save the table {-}
+
+```{r save-analysis-table}
+write_csv(analysis_table, "output/facility_month_analysis_ready.csv")
+output_md5 <- unname(tools::md5sum("output/facility_month_analysis_ready.csv"))
+output_md5
+```
+
+# Provenance note (10 min)
+
+A **provenance note** answers: *where did this table come from, what was done to it, and what should I be careful about?* It travels with the data. We generate it from the objects we already have, so it cannot drift out of date with the code.
+
+```{r provenance}
+excluded <- analysis_table %>%
+  filter(!include_in_analysis) %>%
+  summarise(n_rows = n(),
+            n_facilities = n_distinct(facility_id),
+            no_register     = sum(flag_no_register),
+            no_denominator  = sum(flag_no_denominator),
+            missing_value   = sum(flag_missing_value))
+
+prov <- c(
+  "# Provenance note: facility-month analysis-ready table",
+  "",
+  paste0("**Created:** ", format(Sys.time(), "%Y-%m-%d %H:%M %Z")),
+  paste0("**Analyst:** [write your name here]"),
+  paste0("**Script:** R_Practical_2B_reshape_join_audit.Rmd"),
+  paste0("**Output:** output/facility_month_analysis_ready.csv (",
+         nrow(analysis_table), " rows, ", ncol(analysis_table),
+         " columns; md5 ", output_md5, ")"),
+  "",
+  "## 1. Inputs received",
+  knitr::kable(input_log, format = "pipe"),
+  "",
+  "## 2. Processing rules",
+  "1. Reports reshaped from wide (one column per month) to long, then back to one column per indicator.",
+  paste0("2. Facility identifiers trimmed, upper-cased and (denominators only) stripped of hyphens; ",
+         "district names trimmed and converted to title case."),
+  paste0("3. Sentinel value -999 recoded to NA (", n_sentinel, " cell(s))."),
+  paste0("4. Reports: exact duplicate rows removed; ", nrow(conflict_keys),
+         " facility-indicator-month key(s) with conflicting values quarantined ",
+         "(output/quarantine_conflicting_reports.csv) and excluded pending verification."),
+  paste0("5. Register: exact duplicates removed; ", length(conflict_ids),
+         " facility with conflicting `type` retained with type = NA and flag_register_conflict = TRUE."),
+  paste0("6. Denominators: where two sources existed, DHIS2 preferred over Stats SA; ",
+         sum(denominators_1$flag_denominator_multi_source), " facility flagged."),
+  "7. Register and denominators attached to the reports with left joins asserted many-to-one; row count verified unchanged.",
+  "8. Coverage = 100 x monthly count / (annual target / 12).",
+  "",
+  "## 3. Row flow",
+  knitr::kable(flow_log, format = "pipe"),
+  "",
+  "## 4. Unmatched records (output/audit_unmatched_records.csv)",
+  knitr::kable(count(unmatched_log, issue), format = "pipe"),
+  "",
+  "## 5. Rows flagged for exclusion (include_in_analysis = FALSE)",
+  knitr::kable(excluded, format = "pipe"),
+  "",
+  "## 6. Known limitations",
+  "- Coverage uses one-twelfth of an annual target; it ignores seasonality.",
+  "- Quarantined report values have not been verified with the data provider.",
+  "- Facilities absent from the register have no district or type and cannot be aggregated.",
+  "",
+  "## 7. Environment",
+  paste0("- ", R.version.string),
+  paste0("- tidyverse ", packageVersion("tidyverse"), "; dplyr ", packageVersion("dplyr"),
+         "; tidyr ", packageVersion("tidyr"), "; lubridate ", packageVersion("lubridate"))
+)
+
+writeLines(prov, "output/provenance_note.md")
+cat(prov, sep = "\n")
+```
+
+> **Instructor note.** Ask students to find one sentence in the note that they would not have known without the audit. Then ask what the note would need to say if the department sent a corrected file next month.
+
+## Data dictionary (one line each) {-}
+
+| Column | Meaning |
+|---|---|
+| `facility_id` | Standardised facility code (upper case, no spaces) |
+| `period` | First day of the reporting month (Date) |
+| `anc1`, `dpt3` | Monthly counts of antenatal first visits and third DPT doses |
+| `expected_pregnancies`, `expected_infants` | Annual target populations for the facility catchment |
+| `anc1_coverage`, `dpt3_coverage` | Monthly count as a percentage of one-twelfth of the annual target |
+| `source` | Denominator source retained |
+| `flag_*` | Data-quality flags (see Section 7) |
+| `include_in_analysis` | `TRUE` if the row has a register match, a denominator and no missing counts |
+
+# Wrap-up (5 min)
+
+## Five key messages {-}
+
+1. **Reshape to fit the task.** Long for auditing, plotting and modelling; wide for the final table with one column per indicator.
+2. **Standardise keys once, in a function, for every table.**
+3. **Every join makes a claim.** State it with `relationship =` and check it with `anti_join()`.
+4. **Audit before you analyse.** Separate exact duplicates from conflicts; decide and record a rule for each.
+5. **Leave a trail.** Row-flow log, flags, quarantine file, validation checks and a provenance note.
+
+## Common errors to watch for {-}
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `pivot_wider` returns list-columns | Duplicate keys | Audit first; `values_fn = length` to find them |
+| Row count grows after a join | Duplicate keys on the right | `relationship = "many-to-one"`, de-duplicate the lookup |
+| `NA` everywhere after a join | Key mismatch (case, spaces, format) | `anti_join()`; standardise keys |
+| `object '2025_01' not found` | Non-syntactic column name | Use backticks or `all_of("2025_01")` |
+| Coverage looks fine but district totals are off | Mean of percentages instead of ratio of sums | Aggregate numerator and denominator separately |
+| Dates sort strangely | Period stored as text | Convert with `ym()` or `ymd()` |
+
+## Take-home task {-}
+
+1. Apply `pivot_longer()` to the **denominators** as if they arrived with one column per year (`2024`, `2025`), and join them to the reports by facility **and** year.
+2. Write a `check_join()` function that takes two tables, a key and an expected relationship, and returns a one-row summary of matched and unmatched keys and whether the row count changed.
+3. Extend the provenance note with a section on how you would handle the quarantined records if the department confirmed the higher value was correct.
+
+*Submit the Rmd, the knitted HTML, and `output/provenance_note.md`.*
+
+## Suggested marking guide (10 marks) {-}
+
+| Criterion | Marks |
+|---|---|
+| Correct reshaping with a real `Date` period | 2 |
+| Keys standardised and unmatched records listed | 2 |
+| Duplicates classified (exact vs conflicting) with a documented rule | 2 |
+| Joins asserted with `relationship =`; validation checks pass | 2 |
+| Provenance note complete and accurate | 2 |
+
+```{r session-info}
+sessionInfo()
+```
