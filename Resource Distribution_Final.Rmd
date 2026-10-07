@@ -1,0 +1,259 @@
+---
+title: "Resource Distribution"
+author: "Alice Mugisha and Jovine Bachwenkizi"
+date: "`r Sys.Date()`"
+output: html_document
+---
+Mapping facility locations shows us where services exist, but not whether access to them is equitable. In this section, we calculate a simple resource-distribution indicator, stratify it by an equity dimension (e.g., urban/rural), and refine the map's annotations so the results are clear to a non-technical audience
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+Before starting, we load the packages needed for this section:
+
+  .   sf — reads, manipulates, and analyses spatial (vector) data such as points, lines, and polygons
+  .   ggplot2 — builds the map and other visualisations using a consistent grammar of graphics
+  .   dplyr — supports data wrangling tasks such as filtering, joining, and summarising attribute tables
+  .   ggrepel — improves map readability by automatically repositioning text labels so they don't overlap
+
+```{r}
+#install.packages(c("sf", "ggplot2", "dplyr", "ggrepel"))
+
+library(sf)
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+```
+
+We create a reference point for Kampala using st_point(), which takes a pair of coordinates — longitude first, then latitude. The st_sfc() function wraps this into a spatial geometry object (an sfc, or 'simple feature geometry column'), and crs = 4326 assigns the WGS84 coordinate reference system, matching our other spatial data. Printing kampala displays the object's details, allowing us to confirm the point was created with the correct coordinates and CRS before using it in later steps — for example, to calculate distances from this reference location
+
+```{r}
+# Create the Kampala Reference Point
+kampala <- st_point(
+  c(32.5825, 0.3476)
+) %>%
+  st_sfc(crs = 4326)
+
+#Check it
+kampala
+```
+Longitude and latitude are angular measurements (degrees), not linear distances, so calculating distance directly from unprojected coordinates would produce inaccurate or meaningless results — especially over larger areas, since the length of one degree of longitude varies with latitude. To measure real-world distances in metres or kilometres, we first transform our spatial data into a projected CRS using st_transform(). Here we use UTM Zone 36N (EPSG:32636), which is appropriate for Uganda's location on the Earth's surface and provides accurate distance measurements within this zone. Both the facility points and the Kampala reference point are transformed to ensure they share the same projected CRS before any distance calculations are performed
+
+```{r}
+#Use a projected CRS for distance
+# Distance is not measured in longitudes/latitudes, so there must be transformation of the coordinates to get ditance in Km/m
+
+facilities_projected <- st_transform(
+  facilities_sf,
+  32636
+)
+
+kampala_projected <- st_transform(
+  kampala,
+  32636
+)
+```
+
+With both datasets now in a projected CRS, we can calculate accurate distances using st_distance(), which measures the straight-line (Euclidean) distance between each facility and the Kampala reference point, returned in metres. Since distances in metres can be hard to interpret at this scale, we divide by 1000 to convert to kilometres, and store the result in a new column, distance_from_kampala_km, using as.numeric() to simplify the output into a plain numeric vector. Finally, head() previews the facility ID, name, and calculated distance for the first six rows, allowing us to confirm the values look reasonable (e.g., no negative distances or implausibly large numbers) before using this variable in further analysis.
+
+
+```{r}
+# Calculate distance of each facility from kampala and convert metres to KM
+
+distance_from_kampala <- st_distance(
+  facilities_projected,
+  kampala_projected
+)
+
+facilities_projected$distance_from_kampala_km <-
+  as.numeric(distance_from_kampala) / 1000
+
+# Check
+
+head(
+  facilities_projected[
+    c("facility_id", "facility_name",
+      "distance_from_kampala_km")
+  ]
+)
+```
+
+Continuous distance values are useful for calculation but harder to summarise or present clearly to a non-technical audience. Here, we use mutate() together with case_when() to recode the continuous distance_from_kampala_km variable into four distance bands. case_when() evaluates each condition in order — a facility is assigned to the first band whose condition it satisfies, with TRUE ~ "More than 100 km" acting as a catch-all for any remaining facilities beyond 100 km. Finally, table() produces a simple frequency count, showing how many facilities fall within each distance band, which provides a quick check on the distribution before using these bands in further analysis or mapping.
+
+```{r}
+# Create distance bands for easier analysis
+
+facilities_projected <- facilities_projected %>%
+  mutate(
+    distance_band = case_when(
+      distance_from_kampala_km <= 25 ~ "0–25 km",
+      distance_from_kampala_km <= 50 ~ "26–50 km",
+      distance_from_kampala_km <= 100 ~ "51–100 km",
+      TRUE ~ "More than 100 km"
+    )
+  )
+# Check
+table(facilities_projected$distance_band)
+```
+We first drop the geometry column with st_drop_geometry(), since spatial geometry is not needed for this summary table and can slow down grouped calculations. We then group the data by both distance_band and workload_class using group_by(), and calculate summary statistics for each combination with summarise(): the number of facilities (n()), and the average number of providers, beds, and annual outpatient visits (using mean() with na.rm = TRUE to exclude missing values from the calculation). Setting .groups = "drop" removes the grouping structure from the output afterward, which avoids unexpected behaviour in later steps. The resulting table, distance_workload_summary, helps answer a key equity question: do facilities farther from Kampala tend to be smaller, less staffed, or busier than those closer to the capital?
+
+```{r}
+# Summarize workload by distance band
+distance_workload_summary <- facilities_projected %>%
+  st_drop_geometry() %>%
+  group_by(distance_band, workload_class) %>%
+  summarise(
+    facilities = n(),
+    mean_providers =
+      mean(number_of_providers, na.rm = TRUE),
+    mean_beds =
+      mean(number_of_beds, na.rm = TRUE),
+    mean_outpatient_visits =
+      mean(annual_outpatient_visits, na.rm = TRUE),
+    .groups = "drop"
+  )
+# View it: This answers how do staffing, beds and patient demand vary across facilities at different distances from Kampala?
+distance_workload_summary
+```
+We build the final map using three geom_sf() layers: the Uganda boundary as a light grey background polygon; the facility points, where colour is mapped to workload_class and size is mapped to number_of_providers, so that both staffing workload and facility size are visible at once (with alpha = 0.8 adding slight transparency to reduce overplotting where points overlap); and the Kampala reference point, displayed as a star (shape = 8) to distinguish it clearly from the facility points. theme_minimal() keeps the background uncluttered, and labs() adds a title, subtitle, and legend titles for the colour and size aesthetics.
+
+```{r}
+# Create your main map
+ggplot() +
+  geom_sf(
+    data = uganda,
+    fill = "grey95",
+    colour = "grey60",
+    linewidth = 0.3
+  ) +
+  geom_sf(
+    data = facilities_projected,
+    aes(
+      colour = workload_class,
+      size = number_of_providers
+    ),
+    alpha = 0.8
+  ) +
+  geom_sf(
+    data = kampala_projected,
+    shape = 8,
+    size = 3
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Health Facility Workload and Geographic Distance",
+    subtitle = "Facility workload and staffing in relation to distance from Kampala",
+    colour = "Workload",
+    size = "Healthcare providers"
+  )
+  
+  labs(
+  title = "Where Are Health Facilities Most Heavily Loaded?",
+  subtitle = "Facility workload and staffing across different distances from Kampala",
+  colour = "Staff workload",
+  size = "Number of healthcare providers",
+  caption = "Synthetic data used for GIS training."
+)
+```
+# Each circle represents a health facility. Colour indicates workload level, while circle size represents the number of healthcare providers. Facilities are grouped according to their geographic distance from Kampala.
+
+
+We recreate the distance-band variable, this time naming it geographic_access to reflect its interpretation as a simple proxy for how far facilities are from the capital. The map uses st_transform(uganda, st_crs(facilities_projected)) to re-project the Uganda boundary on the fly, ensuring it matches the projected CRS of the facility data before plotting — a reminder that all spatial layers in a single map must share the same CRS. Facility points are then coloured by geographic_access, allowing viewers to see at a glance which facilities fall within each distance band, while Kampala is again marked with a star. The labs() call provides a clear, plain-language title and subtitle framing distance as a proxy for geographic access, and a caption noting the data is synthetic.
+```{r}
+# Assuming we only concentrate on workload
+
+facilities_projected <- facilities_projected %>%
+  mutate(
+    geographic_access = case_when(
+      distance_from_kampala_km <= 25 ~ "0–25 km",
+      distance_from_kampala_km <= 50 ~ "26–50 km",
+      distance_from_kampala_km <= 100 ~ "51–100 km",
+      TRUE ~ ">100 km"
+    )
+  )
+  
+  ggplot() +
+  geom_sf(
+    data = st_transform(uganda, st_crs(facilities_projected)),
+    fill = "grey95",
+    colour = "grey70",
+    linewidth = 0.3
+  ) +
+  geom_sf(
+    data = facilities_projected,
+    aes(colour = geographic_access),
+    size = 2
+  ) +
+  geom_sf(
+    data = kampala_projected,
+    shape = 8,
+    size = 5
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Geographic Distribution of Health Facilities",
+    subtitle = "Distance from Kampala as a proxy for geographic access",
+    colour = "Distance from Kampala",
+    caption = "Synthetic data used for training."
+  )
+  
+```
+
+After dropping the geometry column, we use count() to tally the number of facilities (n) for each combination of geographic_access and workload_class. Grouping by geographic_access and calculating percentage = n / sum(n) * 100 converts these raw counts into within-band percentages, so each distance band sums to 100% regardless of how many facilities it contains — this makes the comparison fair even if some bands have far more facilities than others. The resulting bar chart, with position = "dodge" placing workload categories side-by-side rather than stacked, allows a direct visual comparison of workload composition across distance bands.
+
+```{r}
+# Relate geographic access to workload
+workload_by_access <- facilities_projected %>%
+  st_drop_geometry() %>%
+  count(geographic_access, workload_class) %>%
+  group_by(geographic_access) %>%
+  mutate(
+    percentage = n / sum(n) * 100
+  )
+  
+  
+  ggplot(
+  workload_by_access,
+  aes(
+    x = geographic_access,
+    y = percentage,
+    fill = workload_class
+  )
+) +
+  geom_col(position = "dodge") +
+  theme_minimal() +
+  labs(
+    title = "Healthcare Worker Workload by Geographic Access",
+    x = "Distance from Kampala",
+    y = "Percentage of Facilities",
+    fill = "Workload Class"
+  )
+  
+ggplot() +
+  geom_sf(
+    data = st_transform(uganda, st_crs(facilities_projected)),
+    fill = "grey95",
+    colour = "grey70",
+    linewidth = 0.3
+  ) +
+  geom_sf(
+    data = facilities_projected,
+    aes(colour = workload_class),
+    size = 2.5,
+    alpha = 0.8
+  ) +
+  geom_sf(
+    data = kampala_projected,
+    shape = 8,
+    size = 5
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Geographic Distribution of Health Facilities by Workload",
+    subtitle = "Facility workload in relation to geographic distance from Kampala",
+    colour = "Workload Class",
+    caption = "Sources: Synthetic data used for GIS training."
+  )
+```
+
